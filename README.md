@@ -29,7 +29,7 @@ A comprehensive shell script for monitoring resource usage on your Ubuntu VPS se
 
 1. Clone or download the repository:
    ```bash
-   git clone https://github.com/yourusername/vpsusagecheck.git
+   git clone https://github.com/dutykh/vpsusagecheck.git
    cd vpsusagecheck
    ```
 
