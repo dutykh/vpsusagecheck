@@ -1,0 +1,34 @@
+# Claude Code development guidance (not needed in repository)
+CLAUDE.md
+
+# Log files
+*.log
+test-output.log
+vps-usage.log
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Temporary files
+*.tmp
+*.temp
+
+# Output files from testing
+output/
+logs/
+
+# System-specific files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Script execution artifacts
+nohup.out
