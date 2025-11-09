@@ -38,14 +38,34 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# Function to safely execute munin-run commands
-safe_munin_run() {
-    local plugin="$1"
-    if command_exists munin-run; then
-        sudo munin-run "$plugin" 2>/dev/null
-    else
-        return 1
+# Function to get monthly traffic from Munin RRD
+get_monthly_traffic() {
+    local rrd_file="$1"
+    local direction="$2"
+    
+    if [ ! -f "$rrd_file" ]; then
+        echo "0"
+        return
     fi
+    
+    # Get first day of current month timestamp
+    local current_month_start=$(date -d "$(date +%Y-%m-01)" +%s)
+    local now=$(date +%s)
+    
+    # Fetch data from beginning of month to now
+    local total_bytes=0
+    if command_exists rrdtool; then
+        # Get average bytes per second and multiply by time intervals to get total bytes
+        local rrd_data=$(rrdtool fetch "$rrd_file" AVERAGE --start $current_month_start --end $now 2>/dev/null | grep -v "nan" | awk 'NF==2 && $2!="nan" {sum+=$2} END {print sum}')
+        
+        if [ ! -z "$rrd_data" ] && [ "$rrd_data" != "" ]; then
+            # Convert from bytes per second average to total bytes
+            # Each data point represents 5 minutes (300 seconds)
+            total_bytes=$(awk "BEGIN {printf \"%.0f\", $rrd_data * 300}")
+        fi
+    fi
+    
+    echo "$total_bytes"
 }
 
 echo -e "${BOLD}${BLUE}╔══════════════════════════════════════════════════════════════════╗${NC}"
@@ -59,42 +79,62 @@ echo
 echo -e "${BOLD}${GREEN}📊 NETWORK TRAFFIC (Outgoing Bandwidth - 32TB Monthly Limit)${NC}"
 echo -e "${BLUE}───────────────────────────────────────────────────────────────────${NC}"
 
-# Try multiple network interface patterns
-network_found=false
-for interface in if_eth0 if_enp if_ens if_; do
-    if network_data=$(safe_munin_run "$interface"); then
-        down_bytes=$(echo "$network_data" | grep "down.value" | cut -d' ' -f2)
-        up_bytes=$(echo "$network_data" | grep "up.value" | cut -d' ' -f2)
+# Try to get monthly data from Munin RRD files
+monthly_found=false
+rrd_down_file="/var/lib/munin/localdomain/localhost.localdomain-if_eth0-down-d.rrd"
+rrd_up_file="/var/lib/munin/localdomain/localhost.localdomain-if_eth0-up-d.rrd"
+
+if [ -f "$rrd_up_file" ] && [ -f "$rrd_down_file" ]; then
+    monthly_down_bytes=$(get_monthly_traffic "$rrd_down_file" "down")
+    monthly_up_bytes=$(get_monthly_traffic "$rrd_up_file" "up")
+    
+    if [ "$monthly_down_bytes" != "0" ] || [ "$monthly_up_bytes" != "0" ]; then
+        monthly_found=true
+        down_human=$(bytes_to_human $monthly_down_bytes)
+        up_human=$(bytes_to_human $monthly_up_bytes)
         
-        if [ ! -z "$down_bytes" ] && [ ! -z "$up_bytes" ] && [ "$down_bytes" != "U" ] && [ "$up_bytes" != "U" ]; then
-            network_found=true
-            down_human=$(bytes_to_human $down_bytes)
-            up_human=$(bytes_to_human $up_bytes)
-            
-            # Calculate percentage of 32TB monthly limit based ONLY on outgoing traffic
-            monthly_limit_bytes=$((32 * 1099511627776))  # 32TB in bytes
-            percentage=$(awk "BEGIN {printf \"%.4f\", ($up_bytes/$monthly_limit_bytes)*100}")
-            
-            echo -e "  ${YELLOW}📥 Inbound (Unlimited):${NC} $down_human"
-            echo -e "  ${YELLOW}📤 Outbound (Counted):${NC}  $up_human"
-            echo -e "  ${CYAN}📈 Monthly Usage:${NC}      ${percentage}% of 32TB outgoing limit"
-            
-            # Warning if approaching limits
-            if command_exists bc && (( $(echo "$percentage > 80" | bc -l) )); then
-                echo -e "  ${RED}⚠️  WARNING: Approaching outgoing bandwidth limit!${NC}"
-            elif command_exists bc && (( $(echo "$percentage > 50" | bc -l) )); then
-                echo -e "  ${YELLOW}⚠️  NOTICE: Over 50% of monthly outgoing bandwidth used${NC}"
+        # Calculate percentage of 32TB monthly limit based ONLY on outgoing traffic
+        monthly_limit_bytes=$((32 * 1099511627776))  # 32TB in bytes
+        percentage=$(awk "BEGIN {printf \"%.4f\", ($monthly_up_bytes/$monthly_limit_bytes)*100}")
+        
+        echo -e "  ${YELLOW}📥 Monthly Inbound:${NC}  $down_human"
+        echo -e "  ${YELLOW}📤 Monthly Outbound:${NC} $up_human"
+        echo -e "  ${CYAN}📈 Monthly Usage:${NC}     ${percentage}% of 32TB outgoing limit"
+        
+        # Warning if approaching limits
+        if command_exists bc && (( $(echo "$percentage > 80" | bc -l) )); then
+            echo -e "  ${RED}⚠️  WARNING: Approaching outgoing bandwidth limit!${NC}"
+        elif command_exists bc && (( $(echo "$percentage > 50" | bc -l) )); then
+            echo -e "  ${YELLOW}⚠️  NOTICE: Over 50% of monthly outgoing bandwidth used${NC}"
+        fi
+        
+        # Show current session info
+        if [ -f /proc/net/dev ]; then
+            interface=$(awk 'NR>2 && $1!~/lo:/ && $2>0 {gsub(/:/, "", $1); print $1; exit}' /proc/net/dev)
+            if [ ! -z "$interface" ]; then
+                rx_bytes=$(awk -v iface="$interface:" '$1==iface {print $2}' /proc/net/dev)
+                tx_bytes=$(awk -v iface="$interface:" '$1==iface {print $10}' /proc/net/dev)
+                
+                if [ ! -z "$rx_bytes" ] && [ ! -z "$tx_bytes" ]; then
+                    rx_human=$(bytes_to_human $rx_bytes)
+                    tx_human=$(bytes_to_human $tx_bytes)
+                    
+                    echo -e "  ${BLUE}📊 Since Last Reboot:${NC}"
+                    echo -e "     📥 Received: $rx_human"
+                    echo -e "     📤 Sent: $tx_human"
+                    echo -e "     🕐 Uptime: $(uptime -p)"
+                fi
             fi
-            break
         fi
     fi
-done
+fi
 
-if [ "$network_found" = false ]; then
-    # Fallback to /proc/net/dev
+if [ "$monthly_found" = false ]; then
+    echo -e "  ${RED}❌ Monthly traffic data not available from Munin RRD${NC}"
+    echo -e "  ${YELLOW}📊 Falling back to current session data:${NC}"
+    
+    # Fallback to /proc/net/dev (current session only)
     if [ -f /proc/net/dev ]; then
-        echo -e "  ${YELLOW}📊 Using system network statistics (fallback)${NC}"
-        # Get the first active interface (excluding lo)
         interface=$(awk 'NR>2 && $1!~/lo:/ && $2>0 {gsub(/:/, "", $1); print $1; exit}' /proc/net/dev)
         if [ ! -z "$interface" ]; then
             rx_bytes=$(awk -v iface="$interface:" '$1==iface {print $2}' /proc/net/dev)
@@ -104,9 +144,10 @@ if [ "$network_found" = false ]; then
                 rx_human=$(bytes_to_human $rx_bytes)
                 tx_human=$(bytes_to_human $tx_bytes)
                 
-                echo -e "  ${YELLOW}📥 Total Received ($interface):${NC} $rx_human"
-                echo -e "  ${YELLOW}📤 Total Transmitted ($interface):${NC} $tx_human"
-                echo -e "  ${CYAN}📝 Note: These are cumulative totals since last reboot${NC}"
+                echo -e "  ${YELLOW}📥 Received (since reboot):${NC} $rx_human"
+                echo -e "  ${YELLOW}📤 Sent (since reboot):${NC} $tx_human"
+                echo -e "  ${CYAN}📝 Note: These are session totals since last reboot${NC}"
+                echo -e "  ${CYAN}🕐 Uptime: $(uptime -p)${NC}"
             fi
         fi
     else
@@ -342,6 +383,6 @@ echo -e "  ${CYAN}Shell:${NC}    $SHELL"
 echo -e "  ${CYAN}User:${NC}     $(whoami)"
 echo
 
-echo -e "${BOLD}${CYAN}💡 TIP: Run this script regularly to monitor your 32TB outgoing bandwidth limit!${NC}"
+echo -e "${BOLD}${CYAN}💡 TIP: This script now shows actual monthly traffic usage from Munin data!${NC}"
 echo -e "${BOLD}${CYAN}🔄 Usage: ./munin-check.sh ${NC}"
-echo -e "${BOLD}${CYAN}📅 Recommended: Add to crontab for regular monitoring${NC}"
+echo -e "${BOLD}${CYAN}📅 Monthly data resets automatically on the 1st of each month${NC}"
