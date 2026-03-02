@@ -10,6 +10,20 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 BOLD='\033[1m'
 
+# Defaults (override by exporting env vars before running the script)
+BANDWIDTH_LIMIT_TB="${BANDWIDTH_LIMIT_TB:-32}"
+BANDWIDTH_NOTICE_PCT="${BANDWIDTH_NOTICE_PCT:-50}"
+BANDWIDTH_WARN_PCT="${BANDWIDTH_WARN_PCT:-80}"
+MEMORY_NOTICE_PCT="${MEMORY_NOTICE_PCT:-75}"
+MEMORY_WARN_PCT="${MEMORY_WARN_PCT:-90}"
+LOAD_NOTICE_PCT="${LOAD_NOTICE_PCT:-75}"
+LOAD_WARN_MULTIPLIER="${LOAD_WARN_MULTIPLIER:-1}"
+DISK_NOTICE_PCT="${DISK_NOTICE_PCT:-80}"
+DISK_WARN_PCT="${DISK_WARN_PCT:-90}"
+DISK_CRITICAL_PCT="${DISK_CRITICAL_PCT:-95}"
+INODE_NOTICE_PCT="${INODE_NOTICE_PCT:-80}"
+INODE_WARN_PCT="${INODE_WARN_PCT:-90}"
+
 # Function to convert bytes to human readable format
 bytes_to_human() {
     local bytes=$1
@@ -38,10 +52,75 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Function to compare two numeric values (supports decimals)
+compare_gt() {
+    awk -v left="$1" -v right="$2" 'BEGIN {exit !(left > right)}'
+}
+
+# Function to detect mount types that are not useful for capacity alerts
+is_ignored_fs_type() {
+    case "$1" in
+        tmpfs|devtmpfs|proc|sysfs|overlay|squashfs|*squash*|efivarfs|cgroup|cgroup2|debugfs|tracefs|pstore|securityfs|mqueue|fusectl|configfs|autofs|ramfs|hugetlbfs|binfmt_misc|bpf|nsfs)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Function to check if a service exists
+service_exists() {
+    local name="$1"
+    if command_exists systemctl; then
+        systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "${name}.service"
+        return $?
+    fi
+    [ -x "/etc/init.d/$name" ]
+}
+
+# Function to check if a service is active
+service_is_active() {
+    local name="$1"
+    if command_exists systemctl; then
+        systemctl is-active "$name" >/dev/null 2>&1
+        return $?
+    fi
+    if command_exists service; then
+        service "$name" status >/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
+
+# Function to estimate current CPU usage from a short interval sample
+get_cpu_usage_percent() {
+    local user1 nice1 system1 idle1 iowait1 irq1 softirq1 steal1 guest1 guest_nice1
+    local user2 nice2 system2 idle2 iowait2 irq2 softirq2 steal2 guest2 guest_nice2
+    local total1 total2 idle_total1 idle_total2 total_delta idle_delta
+
+    read -r _ user1 nice1 system1 idle1 iowait1 irq1 softirq1 steal1 guest1 guest_nice1 < /proc/stat
+    sleep 1
+    read -r _ user2 nice2 system2 idle2 iowait2 irq2 softirq2 steal2 guest2 guest_nice2 < /proc/stat
+
+    total1=$((user1 + nice1 + system1 + idle1 + iowait1 + irq1 + softirq1 + steal1 + guest1 + guest_nice1))
+    total2=$((user2 + nice2 + system2 + idle2 + iowait2 + irq2 + softirq2 + steal2 + guest2 + guest_nice2))
+    idle_total1=$((idle1 + iowait1))
+    idle_total2=$((idle2 + iowait2))
+    total_delta=$((total2 - total1))
+    idle_delta=$((idle_total2 - idle_total1))
+
+    if [ "$total_delta" -le 0 ]; then
+        echo "0.0"
+        return
+    fi
+
+    awk "BEGIN {printf \"%.1f\", (($total_delta - $idle_delta) / $total_delta) * 100}"
+}
+
 # Function to get monthly traffic from Munin RRD
 get_monthly_traffic() {
     local rrd_file="$1"
-    local direction="$2"
     
     if [ ! -f "$rrd_file" ]; then
         echo "0"
@@ -55,13 +134,16 @@ get_monthly_traffic() {
     # Fetch data from beginning of month to now
     local total_bytes=0
     if command_exists rrdtool; then
+        local step=300
+        step=$(rrdtool info "$rrd_file" 2>/dev/null | awk -F' = ' '/^step =/ {print $2; exit}')
+        step=${step:-300}
+
         # Get average bytes per second and multiply by time intervals to get total bytes
         local rrd_data=$(rrdtool fetch "$rrd_file" AVERAGE --start $current_month_start --end $now 2>/dev/null | grep -v "nan" | awk 'NF==2 && $2!="nan" {sum+=$2} END {print sum}')
         
         if [ ! -z "$rrd_data" ] && [ "$rrd_data" != "" ]; then
-            # Convert from bytes per second average to total bytes
-            # Each data point represents 5 minutes (300 seconds)
-            total_bytes=$(awk "BEGIN {printf \"%.0f\", $rrd_data * 300}")
+            # Convert from bytes/second average to total bytes based on RRD step size
+            total_bytes=$(awk "BEGIN {printf \"%.0f\", $rrd_data * $step}")
         fi
     fi
     
@@ -76,7 +158,7 @@ echo -e "${CYAN}Hostname: $(hostname)${NC}"
 echo
 
 # Network Traffic Analysis
-echo -e "${BOLD}${GREEN}📊 NETWORK TRAFFIC (Outgoing Bandwidth - 32TB Monthly Limit)${NC}"
+echo -e "${BOLD}${GREEN}📊 NETWORK TRAFFIC (Outgoing Bandwidth - ${BANDWIDTH_LIMIT_TB}TB Monthly Limit)${NC}"
 echo -e "${BLUE}───────────────────────────────────────────────────────────────────${NC}"
 
 # Try to get monthly data from Munin RRD files
@@ -85,27 +167,27 @@ rrd_down_file="/var/lib/munin/localdomain/localhost.localdomain-if_eth0-down-d.r
 rrd_up_file="/var/lib/munin/localdomain/localhost.localdomain-if_eth0-up-d.rrd"
 
 if [ -f "$rrd_up_file" ] && [ -f "$rrd_down_file" ]; then
-    monthly_down_bytes=$(get_monthly_traffic "$rrd_down_file" "down")
-    monthly_up_bytes=$(get_monthly_traffic "$rrd_up_file" "up")
+    monthly_down_bytes=$(get_monthly_traffic "$rrd_down_file")
+    monthly_up_bytes=$(get_monthly_traffic "$rrd_up_file")
     
     if [ "$monthly_down_bytes" != "0" ] || [ "$monthly_up_bytes" != "0" ]; then
         monthly_found=true
         down_human=$(bytes_to_human $monthly_down_bytes)
         up_human=$(bytes_to_human $monthly_up_bytes)
         
-        # Calculate percentage of 32TB monthly limit based ONLY on outgoing traffic
-        monthly_limit_bytes=$((32 * 1099511627776))  # 32TB in bytes
+        # Calculate percentage of monthly limit based only on outgoing traffic
+        monthly_limit_bytes=$((BANDWIDTH_LIMIT_TB * 1099511627776))
         percentage=$(awk "BEGIN {printf \"%.4f\", ($monthly_up_bytes/$monthly_limit_bytes)*100}")
         
         echo -e "  ${YELLOW}📥 Monthly Inbound:${NC}  $down_human"
         echo -e "  ${YELLOW}📤 Monthly Outbound:${NC} $up_human"
-        echo -e "  ${CYAN}📈 Monthly Usage:${NC}     ${percentage}% of 32TB outgoing limit"
+        echo -e "  ${CYAN}📈 Monthly Usage:${NC}     ${percentage}% of ${BANDWIDTH_LIMIT_TB}TB outgoing limit"
         
         # Warning if approaching limits
-        if command_exists bc && (( $(echo "$percentage > 80" | bc -l) )); then
+        if compare_gt "$percentage" "$BANDWIDTH_WARN_PCT"; then
             echo -e "  ${RED}⚠️  WARNING: Approaching outgoing bandwidth limit!${NC}"
-        elif command_exists bc && (( $(echo "$percentage > 50" | bc -l) )); then
-            echo -e "  ${YELLOW}⚠️  NOTICE: Over 50% of monthly outgoing bandwidth used${NC}"
+        elif compare_gt "$percentage" "$BANDWIDTH_NOTICE_PCT"; then
+            echo -e "  ${YELLOW}⚠️  NOTICE: Over ${BANDWIDTH_NOTICE_PCT}% of monthly outgoing bandwidth used${NC}"
         fi
         
         # Show current session info
@@ -161,11 +243,8 @@ echo -e "${BOLD}${GREEN}💾 MEMORY USAGE${NC}"
 echo -e "${BLUE}───────────────────────────────────────────────────────────────────${NC}"
 
 if [ -f /proc/meminfo ]; then
-    mem_total=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-    mem_available=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
-    mem_free=$(grep MemFree /proc/meminfo | awk '{print $2}')
-    mem_buffers=$(grep Buffers /proc/meminfo | awk '{print $2}')
-    mem_cached=$(grep "^Cached" /proc/meminfo | awk '{print $2}')
+    mem_data=$(awk '/^MemTotal:/ {total=$2} /^MemAvailable:/ {avail=$2} /^MemFree:/ {free=$2} /^Buffers:/ {buffers=$2} /^Cached:/ {cached=$2} END {print total, avail, free, buffers, cached}' /proc/meminfo)
+    read -r mem_total mem_available mem_free mem_buffers mem_cached <<< "$mem_data"
     
     # Use MemAvailable if available, otherwise calculate
     if [ ! -z "$mem_available" ]; then
@@ -186,12 +265,10 @@ if [ -f /proc/meminfo ]; then
     echo -e "  ${YELLOW}🟢 Available:${NC} $mem_available_human"
     
     # Memory usage warning
-    if command_exists bc; then
-        if (( $(echo "$usage_percent > 90" | bc -l) )); then
-            echo -e "  ${RED}⚠️  WARNING: High memory usage!${NC}"
-        elif (( $(echo "$usage_percent > 75" | bc -l) )); then
-            echo -e "  ${YELLOW}⚠️  NOTICE: Memory usage above 75%${NC}"
-        fi
+    if compare_gt "$usage_percent" "$MEMORY_WARN_PCT"; then
+        echo -e "  ${RED}⚠️  WARNING: High memory usage!${NC}"
+    elif compare_gt "$usage_percent" "$MEMORY_NOTICE_PCT"; then
+        echo -e "  ${YELLOW}⚠️  NOTICE: Memory usage above ${MEMORY_NOTICE_PCT}%${NC}"
     fi
     
     # Show swap if available
@@ -232,25 +309,17 @@ if [ -f /proc/loadavg ]; then
     echo -e "  ${YELLOW}📊 Load %:${NC}        ${load_percent}% (of max capacity)"
     
     # Load warnings
-    if command_exists bc; then
-        if (( $(echo "$load_1min > $cpu_cores" | bc -l) )); then
-            echo -e "  ${RED}⚠️  WARNING: System overloaded!${NC}"
-        elif (( $(echo "$load_percent > 75" | bc -l) )); then
-            echo -e "  ${YELLOW}⚠️  NOTICE: High system load${NC}"
-        fi
+    load_warn_threshold=$(awk "BEGIN {printf \"%.2f\", $cpu_cores * $LOAD_WARN_MULTIPLIER}")
+    if compare_gt "$load_1min" "$load_warn_threshold"; then
+        echo -e "  ${RED}⚠️  WARNING: System overloaded!${NC}"
+    elif compare_gt "$load_percent" "$LOAD_NOTICE_PCT"; then
+        echo -e "  ${YELLOW}⚠️  NOTICE: High system load${NC}"
     fi
     
-    # Show CPU usage if available
+    # Show CPU usage using a short interval sample
     if [ -f /proc/stat ]; then
-        cpu_line=$(head -1 /proc/stat)
-        cpu_times=($cpu_line)
-        idle_time=${cpu_times[4]}
-        total_time=0
-        for time in "${cpu_times[@]:1}"; do
-            total_time=$((total_time + time))
-        done
-        cpu_usage=$(awk "BEGIN {printf \"%.1f\", (($total_time - $idle_time) / $total_time) * 100}")
-        echo -e "  ${CYAN}⚡ CPU Usage:${NC}    ${cpu_usage}% (current)"
+        cpu_usage=$(get_cpu_usage_percent)
+        echo -e "  ${CYAN}⚡ CPU Usage:${NC}    ${cpu_usage}% (1s sample)"
     fi
 else
     echo -e "  ${RED}❌ Load information not available${NC}"
@@ -263,14 +332,10 @@ echo -e "${BLUE}─────────────────────�
 
 if command_exists df; then
     # Show main filesystems, excluding temporary and special filesystems
-    df -h 2>/dev/null | grep -vE "^(tmpfs|devtmpfs|udev|none|overlay)" | tail -n +2 | while IFS= read -r line; do
-        # Parse df output more reliably
-        filesystem=$(echo "$line" | awk '{print $1}')
-        size=$(echo "$line" | awk '{print $2}')
-        used=$(echo "$line" | awk '{print $3}')
-        avail=$(echo "$line" | awk '{print $4}')
-        use_percent=$(echo "$line" | awk '{print $5}')
-        mount=$(echo "$line" | awk '{print $6}')
+    df -hPT 2>/dev/null | tail -n +2 | while read -r filesystem fs_type size used avail use_percent mount; do
+        if is_ignored_fs_type "$fs_type"; then
+            continue
+        fi
         
         # Clean up percentage (remove %)
         clean_percent=$(echo "$use_percent" | tr -d '%')
@@ -279,21 +344,21 @@ if command_exists df; then
         echo -e "     Size: $size | Used: $used | Available: $avail | Usage: $use_percent"
         
         # Disk usage warnings
-        if [ "$clean_percent" -gt 95 ]; then
+        if [ "$clean_percent" -gt "$DISK_CRITICAL_PCT" ]; then
             echo -e "     ${RED}🚨 CRITICAL: Disk critically full!${NC}"
-        elif [ "$clean_percent" -gt 90 ]; then
+        elif [ "$clean_percent" -gt "$DISK_WARN_PCT" ]; then
             echo -e "     ${RED}⚠️  WARNING: Disk almost full!${NC}"
-        elif [ "$clean_percent" -gt 80 ]; then
-            echo -e "     ${YELLOW}⚠️  NOTICE: Disk usage above 80%${NC}"
+        elif [ "$clean_percent" -gt "$DISK_NOTICE_PCT" ]; then
+            echo -e "     ${YELLOW}⚠️  NOTICE: Disk usage above ${DISK_NOTICE_PCT}%${NC}"
         fi
     done
     
     # Show inodes usage for root filesystem
     if inode_info=$(df -i / 2>/dev/null | tail -1); then
         inode_used=$(echo "$inode_info" | awk '{print $5}' | tr -d '%')
-        if [ "$inode_used" -gt 80 ]; then
+        if [ "$inode_used" -gt "$INODE_NOTICE_PCT" ]; then
             echo -e "  ${YELLOW}📊 Inode Usage:${NC} ${inode_used}%"
-            if [ "$inode_used" -gt 90 ]; then
+            if [ "$inode_used" -gt "$INODE_WARN_PCT" ]; then
                 echo -e "     ${RED}⚠️  WARNING: High inode usage!${NC}"
             fi
         fi
@@ -334,27 +399,43 @@ if [ "$munin_problems_found" = false ]; then
     echo -e "  ${YELLOW}📊 Basic System Health Check:${NC}"
     
     # Check if system is responsive
-    if uptime_info=$(uptime 2>/dev/null); then
-        uptime_days=$(echo "$uptime_info" | grep -o "up [0-9]* day" | grep -o "[0-9]*" || echo "0")
-        echo -e "     ${GREEN}✅ System responsive (uptime: $uptime_days days)${NC}"
+    if uptime_info=$(uptime -p 2>/dev/null); then
+        echo -e "     ${GREEN}✅ System responsive ($uptime_info)${NC}"
     fi
     
     # Check critical services
     services_ok=0
     services_total=0
-    for service in ssh cron; do
+    for service_group in "ssh:sshd" "cron:crond"; do
+        service_name=""
+        IFS=':' read -r primary alt <<< "$service_group"
+        if service_exists "$primary"; then
+            service_name="$primary"
+        elif service_exists "$alt"; then
+            service_name="$alt"
+        fi
+
+        if [ -z "$service_name" ]; then
+            continue
+        fi
+
         services_total=$((services_total + 1))
-        if systemctl is-active "$service" >/dev/null 2>&1 || service "$service" status >/dev/null 2>&1; then
+        if service_is_active "$service_name"; then
             services_ok=$((services_ok + 1))
         fi
     done
     
-    echo -e "     ${CYAN}🔧 Critical services: $services_ok/$services_total running${NC}"
-    
-    if [ "$services_ok" -eq "$services_total" ]; then
-        echo -e "  ${GREEN}✅ Basic health check passed${NC}"
+    if [ "$services_total" -eq 0 ]; then
+        echo -e "     ${CYAN}🔧 Critical services: no known service manager detected${NC}"
+        echo -e "  ${YELLOW}⚠️  Skipped service checks on this system${NC}"
     else
-        echo -e "  ${YELLOW}⚠️  Some services may need attention${NC}"
+        echo -e "     ${CYAN}🔧 Critical services: $services_ok/$services_total running${NC}"
+        
+        if [ "$services_ok" -eq "$services_total" ]; then
+            echo -e "  ${GREEN}✅ Basic health check passed${NC}"
+        else
+            echo -e "  ${YELLOW}⚠️  Some services may need attention${NC}"
+        fi
     fi
 fi
 echo
@@ -383,6 +464,6 @@ echo -e "  ${CYAN}Shell:${NC}    $SHELL"
 echo -e "  ${CYAN}User:${NC}     $(whoami)"
 echo
 
-echo -e "${BOLD}${CYAN}💡 TIP: This script now shows actual monthly traffic usage from Munin data!${NC}"
+echo -e "${BOLD}${CYAN}💡 TIP: Export BANDWIDTH_LIMIT_TB to match your provider plan (default: 32TB)${NC}"
 echo -e "${BOLD}${CYAN}🔄 Usage: ./munin-check.sh ${NC}"
 echo -e "${BOLD}${CYAN}📅 Monthly data resets automatically on the 1st of each month${NC}"

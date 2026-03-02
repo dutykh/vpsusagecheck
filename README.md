@@ -8,6 +8,7 @@ A comprehensive shell script for monitoring resource usage on your Ubuntu VPS se
 - **Memory Usage**: Real-time memory and swap monitoring with usage warnings
 - **CPU Load**: System load averages and CPU usage percentage
 - **Disk Usage**: Filesystem usage monitoring with critical space alerts
+- **Configurable Thresholds**: Override bandwidth/alert thresholds with environment variables
 - **System Health**: Basic service status and system responsiveness checks
 - **Munin Integration**: Enhanced monitoring when Munin is available
 - **Color-coded Output**: Easy-to-read status indicators and warnings
@@ -22,7 +23,6 @@ A comprehensive shell script for monitoring resource usage on your Ubuntu VPS se
 ### Optional (for enhanced features)
 - **Munin**: For detailed historical monitoring and advanced metrics
 - **w3m**: For parsing Munin HTML reports
-- **bc**: For precise percentage calculations
 - **systemctl**: For service status checking
 
 ## Installation
@@ -49,6 +49,32 @@ A comprehensive shell script for monitoring resource usage on your Ubuntu VPS se
 ```bash
 ./munin-check.sh
 ```
+
+### Custom Limits and Thresholds
+The script supports runtime configuration via environment variables:
+
+```bash
+BANDWIDTH_LIMIT_TB=20 \
+BANDWIDTH_NOTICE_PCT=60 \
+BANDWIDTH_WARN_PCT=85 \
+MEMORY_NOTICE_PCT=70 \
+MEMORY_WARN_PCT=90 \
+./munin-check.sh
+```
+
+Available variables:
+- `BANDWIDTH_LIMIT_TB` (default: `32`)
+- `BANDWIDTH_NOTICE_PCT` (default: `50`)
+- `BANDWIDTH_WARN_PCT` (default: `80`)
+- `MEMORY_NOTICE_PCT` (default: `75`)
+- `MEMORY_WARN_PCT` (default: `90`)
+- `LOAD_NOTICE_PCT` (default: `75`)
+- `LOAD_WARN_MULTIPLIER` (default: `1`)
+- `DISK_NOTICE_PCT` (default: `80`)
+- `DISK_WARN_PCT` (default: `90`)
+- `DISK_CRITICAL_PCT` (default: `95`)
+- `INODE_NOTICE_PCT` (default: `80`)
+- `INODE_WARN_PCT` (default: `90`)
 
 ### Setting up Regular Monitoring
 Add to your crontab for automated monitoring:
@@ -156,13 +182,9 @@ sudo ./munin-check.sh
 ## Customization
 
 ### Modifying Bandwidth Limit
-To change the 32TB monthly limit, edit the script:
+Set the monthly limit at runtime:
 ```bash
-# Find this line in munin-check.sh
-monthly_limit_bytes=$((32 * 1099511627776))  # 32TB in bytes
-
-# Change 32 to your limit in TB
-monthly_limit_bytes=$((YOUR_LIMIT * 1099511627776))
+BANDWIDTH_LIMIT_TB=16 ./munin-check.sh
 ```
 
 ### Adding Custom Checks
@@ -180,6 +202,10 @@ echo -e "${BLUE}─────────────────────�
 - `README.md`: This documentation
 - `LICENSE`: GPL v3 license
 - `CLAUDE.md`: Development guidelines for AI assistants
+
+## Author
+
+Dr. Denys Dutykh (Khalifa University of Science and Technology, Abu Dhabi, UAE)
 
 ## Contributing
 
