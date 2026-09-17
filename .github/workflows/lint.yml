@@ -1,0 +1,74 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck munin-check.sh
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: bash -n munin-check.sh
+
+      - name: --help and --version exit 0
+        run: |
+          ./munin-check.sh --help > /dev/null
+          ./munin-check.sh --version
+
+      - name: Unknown option exits 3
+        run: |
+          rc=0; ./munin-check.sh --definitely-not-an-option > /dev/null 2>&1 || rc=$?
+          echo "exit=$rc"; test "$rc" -eq 3
+
+      - name: Text report exits 0, 1 or 2
+        run: |
+          rc=0; ./munin-check.sh --no-color || rc=$?
+          echo "exit=$rc"; test "$rc" -le 2
+
+      - name: JSON output is valid
+        run: |
+          rc=0; ./munin-check.sh --json > report.json || rc=$?
+          test "$rc" -le 2
+          jq empty report.json
+          jq -e '.status and .network and .memory and .load' report.json > /dev/null
+
+      - name: Piped output carries no ANSI escapes
+        run: |
+          rc=0; ./munin-check.sh > plain.txt || rc=$?
+          test "$rc" -le 2
+          if grep -qP '\x1b\[' plain.txt; then echo "ANSI leaked"; exit 1; fi
+
+      - name: Critical disk threshold yields exit 2
+        run: |
+          rc=0; DISK_CRITICAL_PCT=0 ./munin-check.sh > /dev/null || rc=$?
+          echo "exit=$rc"; test "$rc" -eq 2
+
+      - name: Decimal thresholds do not error
+        run: |
+          rc=0
+          DISK_WARN_PCT=90.5 INODE_WARN_PCT=99.5 MEMORY_WARN_PCT=99.5 \
+            ./munin-check.sh > /dev/null 2> err.txt || rc=$?
+          test "$rc" -le 2
+          if [ -s err.txt ]; then cat err.txt; exit 1; fi
+
+      - name: Config file is honoured and env overrides it
+        run: |
+          printf 'BANDWIDTH_LIMIT_TB=5\n' > test.conf
+          rc=0
+          VPSUSAGECHECK_CONF=test.conf ./munin-check.sh --json > a.json || rc=$?
+          test "$(jq -r '.network.limit_tb' a.json)" = "5"
+          VPSUSAGECHECK_CONF=test.conf BANDWIDTH_LIMIT_TB=9 \
+            ./munin-check.sh --json > b.json || rc=$?
+          test "$(jq -r '.network.limit_tb' b.json)" = "9"

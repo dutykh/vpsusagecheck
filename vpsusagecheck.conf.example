@@ -1,0 +1,60 @@
+# vpsusagecheck configuration
+#
+# Copy to one of the paths below (first readable one wins):
+#   $VPSUSAGECHECK_CONF
+#   ${XDG_CONFIG_HOME:-$HOME/.config}/vpsusagecheck/config
+#   $HOME/.vpsusagecheckrc
+#   /etc/vpsusagecheck.conf
+#
+# This file is sourced by bash, so it must be valid shell. Environment
+# variables set at run time override anything written here.
+
+# --- Bandwidth -------------------------------------------------------------
+# Monthly cap in TiB, as your provider states it.
+BANDWIDTH_LIMIT_TB=32
+
+# What the provider actually meters:
+#   out  outbound only (most common)
+#   in   inbound only
+#   sum  inbound + outbound
+#   max  whichever of the two is larger
+BANDWIDTH_COUNT_MODE=out
+
+BANDWIDTH_NOTICE_PCT=50
+BANDWIDTH_WARN_PCT=80
+
+# --- Memory and swap -------------------------------------------------------
+MEMORY_NOTICE_PCT=75
+MEMORY_WARN_PCT=90
+SWAP_NOTICE_PCT=50
+SWAP_WARN_PCT=80
+
+# --- Load ------------------------------------------------------------------
+LOAD_NOTICE_PCT=75
+# Warn when the 1-minute load exceeds cores * this multiplier.
+LOAD_WARN_MULTIPLIER=1
+
+# --- Disk and inodes -------------------------------------------------------
+DISK_NOTICE_PCT=80
+DISK_WARN_PCT=90
+DISK_CRITICAL_PCT=95
+INODE_NOTICE_PCT=80
+INODE_WARN_PCT=90
+
+# --- Data sources ----------------------------------------------------------
+# Leave empty to auto-detect the interface carrying the default route.
+NET_INTERFACE=
+
+# Only needed if Munin stores its RRDs somewhere unusual, or if auto-detection
+# picks the wrong interface pair.
+MUNIN_RRD_DIR=/var/lib/munin
+MUNIN_WWW_DIR=/var/cache/munin/www
+MUNIN_RRD_UP=
+MUNIN_RRD_DOWN=
+
+# --- Optional checks (1 = on, 0 = off) -------------------------------------
+SHOW_TOP_PROCESSES=1
+TOP_PROCESS_COUNT=3
+CHECK_FAILED_UNITS=1
+CHECK_REBOOT_REQUIRED=1
+CHECK_UPDATES=1
