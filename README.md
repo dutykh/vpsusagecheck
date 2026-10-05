@@ -2,16 +2,32 @@
 
 A single-file shell report for Ubuntu/Debian VPS hosts: network, memory, CPU,
 disk and system health, with particular attention to **outgoing bandwidth
-against your provider's monthly cap**.
+against your provider's monthly cap** and to **disk space**: when each disk will
+fill at the current pace, which folders hold the space, and what can be freed
+safely, with the exact command for each item.
 
-It is designed to be run by hand, or from cron with the output mailed to you
-when — and only when — something needs attention.
+It is designed to be run by hand, or hourly from cron, sending you a short alert
+(through the Hermes agent, or any command you choose) only when something needs
+attention.
 
 ## Features
 
 - **Monthly bandwidth tracking** from the best source available (`vnstat`,
   Munin RRD, or `/proc/net/dev`), with a **month-end projection** so you learn
   you are on track to blow the cap *before* you do
+- **Disk forecast**: the growth of each filesystem over the last week, and the
+  number of days left before it is full, with a warning well ahead of time
+- **Where the space goes**: the largest folders outside the operating system,
+  the folders that grew fastest, and large or long-untouched files
+- **What can be freed**: package caches, unused pnpm and conda packages, old
+  snap revisions, the system journal, Next.js build caches, old remote-server
+  versions and more, each with its size and exact command; `--clean` goes through
+  the safe ones and asks before each, `--free` frees them without questions
+- **Free space by replying to the alert**: with the Hermes agent, answer "free
+  everything safe" to an alert and Hermes runs the safe clean-ups for you
+- **Alerts** with `--notify`: a short message through the Hermes agent (Telegram,
+  WhatsApp, ...) or any command, sent once per new problem, repeated daily while
+  it lasts, and followed by an all-clear
 - **Configurable everything**: limit, count mode and every alert threshold, via
   a config file or environment variables
 - **Nagios-compatible exit codes** (0 OK / 1 WARNING / 2 CRITICAL) so cron
@@ -20,7 +36,7 @@ when — and only when — something needs attention.
 - **Memory, swap, load, CPU, disk and inode** checks with per-resource thresholds
 - **System health**: critical services, failed systemd units, reboot-required
   flag, pending security updates, top memory/CPU consumers
-- **Colour only when it makes sense** — never when redirected to a log file
+- **Colour only when it makes sense**: never when redirected to a log file
 - Optional **Munin integration** when Munin is installed
 
 ## Requirements
@@ -35,11 +51,13 @@ when — and only when — something needs attention.
 
 | Tool | What it adds |
 |---|---|
-| **`vnstat`** | Accurate month-to-date totals that survive reboots. **Strongly recommended** — this is the only source that is both precise and reboot-proof. |
+| **`vnstat`** | Accurate month-to-date totals that survive reboots. **Strongly recommended**: this is the only source that is both precise and reboot-proof. |
 | `rrdtool` + Munin | Month-to-date totals from Munin's own RRD archives |
 | `w3m` | Munin plugin problem counts from `problems.html` |
 | `systemctl` | Service and failed-unit checks |
 | `jq` | Slightly more robust `vnstat` parsing (a `--oneline` fallback is used otherwise) |
+| `flock`, `ionice`, `timeout` | Safe overlapping runs, an idle-priority folder scan with a time limit (util-linux and coreutils, present on Ubuntu) |
+| `hermes` | Alerts through the [Hermes agent](https://github.com/NousResearch/hermes-agent) with `NOTIFY_HERMES_TO` |
 
 Without any of these the script still runs, but bandwidth falls back to
 since-boot counters, which cannot answer "how much of my monthly cap have I
@@ -77,6 +95,10 @@ sudo install -m 0644 vpsusagecheck.conf.example /etc/vpsusagecheck.conf
 ./munin-check.sh                 # text report
 ./munin-check.sh --json          # machine-readable
 ./munin-check.sh --no-color      # force plain text
+./munin-check.sh --scan          # rescan the folders now
+./munin-check.sh --clean         # free the safe items, asking before each
+./munin-check.sh --free list     # the safe items and their names
+./munin-check.sh --free all      # free all of them, without questions
 ./munin-check.sh --help          # all options
 ```
 
@@ -87,6 +109,14 @@ sudo install -m 0644 vpsusagecheck.conf.example /etc/vpsusagecheck.conf
 | `-j`, `--json` | JSON instead of the text report |
 | `--color=WHEN` | `auto` (default), `always`, `never` |
 | `--no-color` | Same as `--color=never` |
+| `--scan` | Rescan the folders now instead of using the cached scan |
+| `--no-scan` | Never start a folder scan; the cached one, if any, is still shown |
+| `--clean` | Offer the safe clean-ups one at a time, asking before each (needs a terminal) |
+| `--free WHAT` | Free safe items without asking: `list`, `all`, or names separated by commas (`pnpm-store,npm-cache`) |
+| `-y`, `--yes` | With `--clean`: no questions, the same as `--free all` |
+| `--notify` | Send an alert when something needs attention (for cron) |
+| `--notify-test` | Send a test alert through the configured channel and exit |
+| `-q`, `--quiet` | Print nothing (for cron, with `--notify`) |
 | `-V`, `--version` | Print version and exit |
 | `-h`, `--help` | Print help and exit |
 
@@ -98,9 +128,9 @@ honoured.
 
 | Code | Meaning |
 |---|---|
-| `0` | OK — nothing crossed a threshold |
-| `1` | WARNING — at least one warning threshold crossed |
-| `2` | CRITICAL — at least one critical threshold crossed |
+| `0` | OK: nothing crossed a threshold |
+| `1` | WARNING: at least one warning threshold crossed |
+| `2` | CRITICAL: at least one critical threshold crossed |
 | `3` | Usage error (bad option or bad setting) |
 
 ## Configuration
@@ -108,7 +138,7 @@ honoured.
 Precedence, lowest to highest:
 
 1. Built-in defaults
-2. Config file — the first readable of:
+2. Config file, the first readable of:
    `$VPSUSAGECHECK_CONF`,
    `${XDG_CONFIG_HOME:-$HOME/.config}/vpsusagecheck/config`,
    `$HOME/.vpsusagecheckrc`,
@@ -151,19 +181,132 @@ BANDWIDTH_LIMIT_TB=20 BANDWIDTH_WARN_PCT=85 ./munin-check.sh
 | `CHECK_FAILED_UNITS` | `1` | Report failed systemd units |
 | `CHECK_REBOOT_REQUIRED` | `1` | Report `/var/run/reboot-required` |
 | `CHECK_UPDATES` | `1` | Report pending (security) updates |
+| `STATE_DIR` | see below | Where the disk history, the cached scan and the alert memory are kept |
+| `DISK_TREND_DAYS` | `7` | Days of history the disk forecast is fitted over |
+| `DISK_FILL_NOTICE_DAYS` | `30` | Notice when a disk will be full within this many days |
+| `DISK_FILL_WARN_DAYS` | `14` | Warning, same measure |
+| `DISK_FILL_CRITICAL_DAYS` | `3` | Critical, same measure |
+| `DISK_SCAN` | `1` | `0` turns the folder scan and the savings list off |
+| `DISK_SCAN_ROOTS` | auto | Folders to scan, space-separated; default `/home /root /srv /opt /var /usr/local /tmp` plus extra data mounts |
+| `DISK_SCAN_DEPTH` | `4` | How deep below each root folder sizes are recorded |
+| `DISK_SCAN_MAX_AGE_HOURS` | `12` | How long a scan is reused before `--notify` runs a new one |
+| `DISK_SCAN_TIMEOUT` | `600` | Seconds a scan may take before it is stopped |
+| `DISK_TOP_COUNT` | `10` | How many large folders to list |
+| `DISK_TOP_MIN_MB` | `256` | Smallest folder worth listing |
+| `DISK_BIGFILE_MB` | `1024` | Smallest file listed as a large file |
+| `DISK_RECLAIM_MIN_MB` | `50` | Smallest saving worth listing |
+| `DISK_RECLAIM_NOTICE_GB` | `5` | Notice when at least this much can be freed safely |
+| `DISK_JOURNAL_KEEP_MB` | `200` | How much system journal a clean-up keeps |
+| `NOTIFY_HERMES_TO` | empty | Hermes delivery target for alerts, e.g. `telegram` |
+| `NOTIFY_COMMAND` | empty | Any shell command that sends an alert (see below) |
+| `NOTIFY_MIN_LEVEL` | `warning` | Lowest level that triggers an alert: `notice`, `warning`, `critical` |
+| `NOTIFY_REPEAT_HOURS` | `24` | Repeat an alert this often while the problem lasts |
+| `NOTIFY_RECOVERY` | `1` | Send an all-clear when everything is back to normal |
+| `HERMES_BIN` | auto | Path to `hermes`; found on the PATH or in `~/.local/bin` otherwise |
 
-Thresholds accept decimals — `DISK_WARN_PCT=87.5` is valid.
+Thresholds accept decimals: `DISK_WARN_PCT=87.5` is valid.
+
+## Disk space: forecast, largest folders and savings
+
+The `[SPC]` section of the report answers three questions about disk space.
+
+**When will the disk be full?** Every run records how much of each filesystem
+is in use. The forecast fits a straight line through the last `DISK_TREND_DAYS`
+of these records and divides the free space by the daily growth. It needs 12
+hours of history before it says anything, so the script has to run regularly
+(hourly from cron, see below). It works on the gigabytes actually used, not on
+percentages: when a disk is enlarged, the percentage drops overnight while
+nothing was deleted, and a forecast built on percentages (Munin's, for
+instance) is fooled; this one is not. A sudden burst, a disk that would be full
+within `DISK_FILL_CRITICAL_DAYS` at the pace of the last 24 hours, raises its own
+warning.
+
+**Where is the space?** A folder scan measures every folder up to
+`DISK_SCAN_DEPTH` levels below `/home`, `/root`, `/srv`, `/opt`, `/var`,
+`/usr/local`, `/tmp` and any extra data mount; the operating system itself is
+left out. The list names the folder a person would recognise: the pnpm store
+rather than the home directory that contains it. A folder is listed when at
+least half of it is not already explained by smaller folders listed below it.
+Each listed folder shows how much it grew over the last week, and the folders
+that grew fastest have their own list. The report also says how much of the
+used space the scan accounts for, and how many folders the current user could
+not read (run as root for a complete picture).
+
+The scan is the one slow part of the report (about a minute for a million files,
+more on a cold cache), so it runs at idle priority, is stopped after
+`DISK_SCAN_TIMEOUT` seconds, and its result is kept for
+`DISK_SCAN_MAX_AGE_HOURS`. A run by hand shows the kept result with its age and
+never starts a long scan by surprise; `--scan` refreshes it, and so does the
+hourly `--notify` run once the result is older than the limit.
+
+**What can be freed?** Each item comes with its size, its exact command and a
+one-line explanation, in two groups.
+
+| Safe to free (rebuilt or downloaded again when needed) | Worth reviewing first |
+|---|---|
+| pnpm store: packages no installed project links to (`pnpm store prune`) | Rotated logs in `/var/log` |
+| npm download cache | Other caches in `~/.cache` (for example browser binaries) |
+| | Old pnpm store layouts left by an earlier pnpm major version |
+| conda package cache: archives and packages no environment uses | Log files over 200 MB |
+| Old snap revisions | Large files untouched for 180 days |
+| System journal above `DISK_JOURNAL_KEEP_MB` | Packages `apt autoremove` would remove |
+| APT's downloaded package files | Unused Docker images |
+| Next.js `.next/cache` build caches | |
+| pip, uv, pnpm, yarn, node-gyp and go-build caches in `~/.cache` | |
+| Old Warp, VS Code and Cursor remote-server versions (the two newest are kept) | |
+| Docker build cache | |
+
+The size of the pnpm and conda items is what their own clean-up would remove:
+the files that are not hard-linked into any project or environment. A pnpm store
+keeps one layout per major version (`store/v10`, `store/v11`), and
+`pnpm store prune` cleans only the layout of the pnpm that runs it; an older
+layout is therefore listed for review, with the command that prunes it using the
+older pnpm.
+
+`--clean` goes through the safe items, largest first, shows each command and
+asks before running it. Items that need root run through `sudo`, which asks for
+your password. It measures the space actually freed, and it never touches the
+"worth reviewing" group. Run it in a terminal on the server:
+
+```bash
+munin-check --clean
+```
+
+Each safe item also has a short name, shown in brackets in the report:
+`pnpm-store`, `npm-cache`, `conda-pkgs`, `cache:pip`, `next-cache:SITE`,
+`old-versions:warp`, `journal`, `apt`, `snaps`, `docker-build`. `--free` uses
+these names to free items without asking, which is what a program (or the Hermes
+agent) needs:
+
+```bash
+munin-check --free list                    # what can be freed now, with names
+munin-check --free pnpm-store,npm-cache    # free these two
+munin-check --free all                     # free every safe item (= --clean --yes)
+```
+
+Without a terminal nobody can type a password, so `--free` runs `sudo -n`: an
+item that needs root is reported with the exact command to run by hand, unless
+sudo is passwordless for that command.
+
+The report also lists **deleted files still held open** by a running program
+(a log removed while the daemon keeps writing to it): the space returns only when
+that program restarts. Without root only your own programs are visible.
+
+The history, the cached scan and the alert memory live in `STATE_DIR`:
+`/var/lib/vpsusagecheck` when run as root, otherwise
+`~/.local/state/vpsusagecheck`. If it cannot be written, the forecast and the
+alert memory are switched off and the report says so.
 
 ## Where the bandwidth number comes from
 
 The report names its source on the `Interface:` line. In order of preference:
 
-1. **`vnstat`** — exact monthly totals, kept in its own database, unaffected by
+1. **`vnstat`**: exact monthly totals, kept in its own database, unaffected by
    reboots. This is what you want.
-2. **Munin RRD** — `rrdtool` integrates the stored rate over the month. The
+2. **Munin RRD**: `rrdtool` integrates the stored rate over the month. The
    `if_<iface>-{up,down}-d.rrd` pair is located automatically under
    `MUNIN_RRD_DIR`, matching the default-route interface where possible.
-3. **`/proc/net/dev`** — since-boot counters only. Shown for context, but it
+3. **`/proc/net/dev`**: since-boot counters only. Shown for context, but it
    **cannot** tell you your month-to-date usage, so no cap percentage is
    reported and the script records a notice instead.
 
@@ -175,46 +318,87 @@ script raises a warning even while current usage is still comfortable.
 > multiplied the sum of fetched rate samples by the RRD's *base* step (300 s).
 > For a month-long window `rrdtool` serves data from a consolidated archive
 > whose rows span `pdp_per_row × step` seconds, so the old figure was too low by
-> exactly that factor — typically **24×** on a stock Munin `if_` RRD, with the
+> exactly that factor, typically **24×** on a stock Munin `if_` RRD, with the
 > factor drifting as the month progressed. v2 hands the integration to
 > `rrdtool` itself (`VDEF:…,TOTAL`), which is correct. **Expect the reported
-> monthly usage to jump substantially after upgrading** — the new number is the
+> monthly usage to jump substantially after upgrading**; the new number is the
 > right one.
 
 ## Automating it
 
-### Daily report by mail, only when something is wrong
+### Hourly watch with alerts
 
-The exit code makes this simple and robust — no grepping the output. Put this
-in `/usr/local/bin/vps-alert`:
+Run the script every hour with `--notify --quiet`. It records the disk history
+the forecast needs, refreshes the folder scan twice a day, and sends a short
+alert only when something needs attention:
 
-```bash
-#!/bin/sh
-# Mail the report only when something needs attention.
-out=$(mktemp) || exit 1
-trap 'rm -f "$out"' EXIT
+- when a problem at or above `NOTIFY_MIN_LEVEL` appears, or gets worse;
+- again every `NOTIFY_REPEAT_HOURS` while it lasts;
+- once more, as an all-clear, when everything is back to normal.
 
-/usr/local/bin/munin-check > "$out" 2>&1
-status=$?
+The alert is a few lines of plain text: the disk forecast in one sentence, the
+problems (new ones marked), the five largest safe savings with their commands,
+and a pointer to `--clean`.
 
-if [ "$status" -ge 1 ]; then
-    mail -s "VPS alert ($status): $(hostname)" you@example.com < "$out"
-fi
-exit 0
-```
-
-```bash
-sudo chmod +x /usr/local/bin/vps-alert
-```
+**Through the Hermes agent.** Hermes delivers the alert to any messaging
+platform it is configured for, using its own credentials, without involving the
+model. If you reply to the alert in that chat, Hermes sees the whole alert as
+context, so you can ask it to deal with the problem. In the config file:
 
 ```bash
-# /etc/cron.d/vpsusagecheck
-MAILTO=""
-0 6 * * * root /usr/local/bin/vps-alert
+NOTIFY_HERMES_TO=telegram
 ```
 
-A predictable path such as `/tmp/vpscheck.out` would be unsafe for a root cron
-job, which is why the wrapper uses `mktemp`.
+and in the crontab of the user who runs Hermes (`crontab -e`):
+
+```bash
+0 * * * * /usr/local/bin/munin-check --notify --quiet
+```
+
+Check the channel once with `munin-check --notify-test`. `hermes` is found on
+the PATH or in `~/.local/bin`; set `HERMES_BIN` if it lives elsewhere.
+
+**Through any other command.** `NOTIFY_COMMAND` is run by `sh` with the
+variables `NOTIFY_SUBJECT`, `NOTIFY_BODY_FILE`, `NOTIFY_LEVEL` and `NOTIFY_HOST`.
+Write it in single quotes, since the config file is sourced by bash and double
+quotes would expand the variables too early:
+
+```bash
+NOTIFY_COMMAND='mail -s "$NOTIFY_SUBJECT" you@example.com < "$NOTIFY_BODY_FILE"'
+NOTIFY_COMMAND='tg-ping --title "$NOTIFY_SUBJECT" < "$NOTIFY_BODY_FILE"'
+```
+
+Both channels may be set; an alert counts as delivered when one of them succeeds.
+A failed delivery is retried at the next run.
+
+### Freeing space by replying to an alert
+
+With Hermes as the channel, the alert ends with "reply to this message to free
+them". Reply "free everything safe", or name the items ("free the pnpm store and
+the npm cache"), and Hermes runs `munin-check --free` on the server, then answers
+with the space freed and the free space left. Hermes never deletes anything
+itself: `--free` can only perform the safe clean-ups listed above, and the skill
+that teaches Hermes this procedure forbids every other deleting command, sudo and
+password requests.
+
+Install the skill once, as the user who runs Hermes:
+
+```bash
+mkdir -p ~/.hermes/skills/devops/vps-disk-cleanup
+cp ~/tools/vpsusagecheck/hermes/vps-disk-cleanup/SKILL.md ~/.hermes/skills/devops/vps-disk-cleanup/
+```
+
+The items that need root (`journal`, `apt`, `snaps`) come back with the command
+for you to paste. To let Hermes do the journal and the APT cache as well, allow
+exactly these two commands without a password (`sudo visudo -f
+/etc/sudoers.d/vpsusagecheck`, replacing `dds` by that user):
+
+```text
+dds ALL=(root) NOPASSWD: /usr/bin/journalctl --vacuum-size=200M, /usr/bin/apt-get clean
+```
+
+Old snap revisions stay manual: a sudo rule for `snap remove` could not be
+narrowed to old revisions.
 
 ### Unconditional daily log
 
@@ -229,10 +413,14 @@ Output is automatically plain text when redirected, so the log stays readable.
 ```bash
 ./munin-check.sh --json | jq '.network.projected_pct'
 ./munin-check.sh --json | jq -r '.issues[] | "\(.level): \(.message)"'
+./munin-check.sh --json | jq '.disk_analysis.trends[] | {mount, days_to_full}'
 ```
 
 The JSON contains `status`, `exit_code`, `network`, `memory`, `load`,
-`filesystems[]`, `system` and `issues[]`.
+`filesystems[]`, `disk_analysis`, `system` and `issues[]`. `disk_analysis`
+holds `trends[]`, `scan`, `coverage[]`, `largest_dirs[]`, `growing_dirs[]`,
+`large_files[]`, `savings[]` with their totals, and `deleted_open[]`. Every
+issue carries a stable `key` naming the kind of problem.
 
 ## Understanding the output
 
@@ -242,6 +430,7 @@ The JSON contains `status`, `exit_code`, `network`, `memory`, `load`,
 | `[MEM]` | Total / used / available memory and swap |
 | `[CPU]` | 1/5/15-minute load, core count, load as % of capacity, sampled CPU usage |
 | `[DSK]` | Real filesystems only (pseudo-filesystems are skipped), plus inode usage when it is high |
+| `[SPC]` | Disk forecast, folder scan, largest and fastest-growing folders, large files, what can be freed, deleted files still held open |
 | `[SYS]` | Munin plugin states, critical services, failed units, reboot flag, pending updates, uptime |
 | `[TOP]` | Top memory and CPU consumers |
 | `[---]` | Host summary, overall status, and every issue found |
@@ -255,7 +444,7 @@ criticals do.
 ### "No month-to-date data available"
 
 No `vnstat`, and no usable Munin RRD. Install `vnstat` (see
-[Installation](#installation)) — it is the reliable fix.
+[Installation](#installation)): it is the reliable fix.
 
 ### Bandwidth source shows `proc`
 
@@ -293,23 +482,39 @@ NET_INTERFACE=ens3 ./munin-check.sh
 ```
 
 By default the script measures the interface carrying the default route, which
-is normally the metered one — not a Docker bridge or VPN tunnel.
+is normally the metered one, not a Docker bridge or VPN tunnel.
 
 ### Permission issues
 
 Most checks read `/proc` and need no privileges. Munin RRDs and
 `/var/cache/munin/www` may not be world-readable; run as root or add your user
-to the `munin` group if you want those sections.
+to the `munin` group if you want those sections. The folder scan skips what the
+current user cannot read and says how many folders that was.
+
+### The disk forecast says "collecting history"
+
+The forecast needs at least three samples spanning 12 hours. Run the script
+hourly from cron (see [Hourly watch with alerts](#hourly-watch-with-alerts)).
+
+### Alerts do not arrive
+
+```bash
+munin-check --notify-test
+```
+
+prints why a channel failed. Under cron the PATH is minimal: set `HERMES_BIN` to
+the full path of `hermes` if it is not in `~/.local/bin`.
 
 ## Development
 
 ```bash
 bash -n munin-check.sh     # syntax check
-shellcheck munin-check.sh  # lint (also run in CI)
+shellcheck munin-check.sh  # lint
 ```
 
-CI runs `shellcheck` plus a smoke-test suite on every push and pull request —
-see `.github/workflows/lint.yml`.
+Both are run by hand before a change goes in. The script can also be sourced
+(`. ./munin-check.sh`) to call a single function in a test; it only runs
+`main` when executed.
 
 ## Files
 
@@ -317,7 +522,7 @@ see `.github/workflows/lint.yml`.
 |---|---|
 | `munin-check.sh` | The tool |
 | `vpsusagecheck.conf.example` | Annotated sample configuration |
-| `.github/workflows/lint.yml` | shellcheck + smoke tests |
+| `hermes/vps-disk-cleanup/SKILL.md` | Hermes skill: free space when you reply to an alert |
 | `.shellcheckrc` | Lint configuration |
 | `README.md` | This document |
 | `LICENSE` | GNU GPL v3 |
@@ -336,9 +541,38 @@ Dr. Denys Dutykh (Khalifa University of Science and Technology, Abu Dhabi, UAE)
 
 ## License
 
-GNU General Public License v3.0 — see [LICENSE](LICENSE).
+GNU General Public License v3.0, see [LICENSE](LICENSE).
 
 ## Changelog
+
+### v2.1.0
+
+**Added**
+
+- Disk forecast: daily growth of each filesystem fitted over the last week, the
+  days left before it is full, with notice, warning and critical levels
+  (`DISK_FILL_*_DAYS`) and a separate alert for a sudden burst. It works on the
+  bytes in use, so enlarging a disk does not upset it.
+- Folder scan of the non-system folders: largest folders, folders that grew
+  fastest, large and long-untouched files, and how much of the used space the
+  scan accounts for. Cached, idle priority, time-limited.
+- Savings list with sizes and exact commands, split into safe items and items
+  worth reviewing, and `--clean` to free the safe ones interactively.
+- `--free list|all|NAME,...` and `--clean --yes` to free safe items without
+  questions, by their short names, and a Hermes skill
+  (`hermes/vps-disk-cleanup`) so that replying to an alert frees the space.
+- Deleted files still held open by running programs.
+- Alerts with `--notify` through the Hermes agent (`NOTIFY_HERMES_TO`) or any
+  command (`NOTIFY_COMMAND`): sent once per new problem, repeated every
+  `NOTIFY_REPEAT_HOURS`, followed by an all-clear. `--notify-test`.
+- `--scan`, `--no-scan`, `--quiet`.
+- A stable `key` for every issue, in the JSON output too, and a
+  `disk_analysis` object in the JSON.
+
+**Removed**
+
+- The GitHub Actions workflow; `bash -n` and `shellcheck` are run by hand.
+- The `vps-alert` mail wrapper from the README, superseded by `--notify`.
 
 ### v2.0.0
 

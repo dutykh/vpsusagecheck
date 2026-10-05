@@ -1,5 +1,8 @@
 # vpsusagecheck configuration
 #
+# Author: Dr. Denys Dutykh (Khalifa University of Science and Technology,
+#         Abu Dhabi, UAE)
+#
 # Copy to one of the paths below (first readable one wins):
 #   $VPSUSAGECHECK_CONF
 #   ${XDG_CONFIG_HOME:-$HOME/.config}/vpsusagecheck/config
@@ -58,3 +61,55 @@ TOP_PROCESS_COUNT=3
 CHECK_FAILED_UNITS=1
 CHECK_REBOOT_REQUIRED=1
 CHECK_UPDATES=1
+
+# --- State -----------------------------------------------------------------
+# Where the disk history, the cached folder scan and the alert memory are kept.
+# Empty: /var/lib/vpsusagecheck for root, ~/.local/state/vpsusagecheck otherwise.
+STATE_DIR=
+
+# --- Disk forecast ---------------------------------------------------------
+# The trend is fitted over this many days of history (the script must run
+# regularly, e.g. hourly from cron, to collect it).
+DISK_TREND_DAYS=7
+# Raise a notice, a warning or a critical when a disk will be full within:
+DISK_FILL_NOTICE_DAYS=30
+DISK_FILL_WARN_DAYS=14
+DISK_FILL_CRITICAL_DAYS=3
+
+# --- Folder scan and savings -----------------------------------------------
+# 0 turns the folder scan and the savings list off.
+DISK_SCAN=1
+# Folders to scan, space-separated. Empty: /home /root /srv /opt /var
+# /usr/local /tmp plus any extra data mount.
+DISK_SCAN_ROOTS=
+DISK_SCAN_DEPTH=4
+# A scan is reused for this long; the hourly --notify run refreshes it after.
+DISK_SCAN_MAX_AGE_HOURS=12
+# A scan taking longer than this many seconds is stopped.
+DISK_SCAN_TIMEOUT=600
+DISK_TOP_COUNT=10
+DISK_TOP_MIN_MB=256
+DISK_BIGFILE_MB=1024
+# Savings smaller than this are not listed.
+DISK_RECLAIM_MIN_MB=50
+# A notice when at least this much can be freed safely.
+DISK_RECLAIM_NOTICE_GB=5
+# How much of the system journal a clean-up keeps.
+DISK_JOURNAL_KEEP_MB=200
+
+# --- Alerts (sent only with --notify) --------------------------------------
+# Through the Hermes agent: the delivery target, as for `hermes send --to`.
+NOTIFY_HERMES_TO=
+# Full path to hermes, when it is neither on the PATH nor in ~/.local/bin.
+HERMES_BIN=
+# Or through any command, run by sh with NOTIFY_SUBJECT, NOTIFY_BODY_FILE,
+# NOTIFY_LEVEL and NOTIFY_HOST set. Keep the single quotes: this file is
+# sourced by bash, and double quotes would expand the variables right here.
+#NOTIFY_COMMAND='mail -s "$NOTIFY_SUBJECT" you@example.com < "$NOTIFY_BODY_FILE"'
+NOTIFY_COMMAND=
+# Lowest level that triggers an alert: notice, warning or critical.
+NOTIFY_MIN_LEVEL=warning
+# Repeat an alert this often while the problem lasts.
+NOTIFY_REPEAT_HOURS=24
+# 1 sends an all-clear when everything is back to normal.
+NOTIFY_RECOVERY=1
