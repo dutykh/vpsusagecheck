@@ -22,7 +22,7 @@ set -uo pipefail
 # numeric comparison in the script.
 export LC_ALL=C
 
-readonly VERSION="2.1.0"
+readonly VERSION="2.2.0"
 readonly PROGNAME="${0##*/}"
 
 # Exit codes (Nagios-compatible).
@@ -49,7 +49,7 @@ readonly CONFIG_KEYS=(
     INODE_NOTICE_PCT INODE_WARN_PCT
     NET_INTERFACE MUNIN_RRD_UP MUNIN_RRD_DOWN MUNIN_RRD_DIR MUNIN_WWW_DIR
     SHOW_TOP_PROCESSES TOP_PROCESS_COUNT
-    CHECK_FAILED_UNITS CHECK_REBOOT_REQUIRED CHECK_UPDATES
+    CHECK_FAILED_UNITS IGNORE_FAILED_UNITS CHECK_REBOOT_REQUIRED CHECK_UPDATES
     STATE_DIR
     DISK_TREND_DAYS DISK_FILL_NOTICE_DAYS DISK_FILL_WARN_DAYS DISK_FILL_CRITICAL_DAYS
     DISK_SCAN DISK_SCAN_ROOTS DISK_SCAN_DEPTH DISK_SCAN_MAX_AGE_HOURS DISK_SCAN_TIMEOUT
@@ -145,6 +145,9 @@ MUNIN_WWW_DIR="${MUNIN_WWW_DIR:-/var/cache/munin/www}"
 SHOW_TOP_PROCESSES="${SHOW_TOP_PROCESSES:-1}"
 TOP_PROCESS_COUNT="${TOP_PROCESS_COUNT:-3}"
 CHECK_FAILED_UNITS="${CHECK_FAILED_UNITS:-1}"
+# Failed units that are known and harmless: names or shell patterns, separated by
+# spaces or commas. The report still names them, but they raise no warning.
+IGNORE_FAILED_UNITS="${IGNORE_FAILED_UNITS:-}"
 CHECK_REBOOT_REQUIRED="${CHECK_REBOOT_REQUIRED:-1}"
 CHECK_UPDATES="${CHECK_UPDATES:-1}"
 
@@ -843,7 +846,7 @@ collect_disk() {
 # ---------------------------------------------------------------------------
 MUNIN_CRITICAL="" MUNIN_WARNING="" MUNIN_UNKNOWN=""
 SERVICES_OK="" SERVICES_TOTAL="" SERVICES_DOWN=()
-FAILED_UNITS="" FAILED_UNIT_NAMES=()
+FAILED_UNITS="" FAILED_UNIT_NAMES=() IGNORED_UNIT_NAMES=()
 REBOOT_REQUIRED="unknown"
 UPDATES_TOTAL="" UPDATES_SECURITY=""
 
@@ -891,19 +894,41 @@ collect_services() {
     done
 }
 
+# True when the unit is named in IGNORE_FAILED_UNITS: unit names or shell
+# patterns (cloud-init-*.service), separated by spaces or commas.
+unit_is_ignored() {
+    local unit="$1" pattern
+    local -a patterns=()
+    # read does not expand globs, so a pattern such as * reaches the test intact.
+    read -r -a patterns <<<"${IGNORE_FAILED_UNITS//,/ }"
+    for pattern in ${patterns[@]+"${patterns[@]}"}; do
+        # The unquoted right-hand side is deliberate: it is a pattern.
+        # shellcheck disable=SC2053
+        [[ $unit == $pattern ]] && return 0
+    done
+    return 1
+}
+
 collect_failed_units() {
     if [ "$CHECK_FAILED_UNITS" != "1" ] || ! command_exists systemctl; then return 0; fi
-    local names
+    local names name
     names=$(systemctl list-units --state=failed --no-legend --plain --no-pager 2>/dev/null \
         | awk '{print $1}' | grep -v '^$') || true
+    FAILED_UNITS=0 FAILED_UNIT_NAMES=() IGNORED_UNIT_NAMES=()
     if [ -n "$names" ]; then
-        mapfile -t FAILED_UNIT_NAMES <<<"$names"
+        while read -r name; do
+            if unit_is_ignored "$name"; then
+                IGNORED_UNIT_NAMES+=("$name")
+            else
+                FAILED_UNIT_NAMES+=("$name")
+            fi
+        done <<<"$names"
         FAILED_UNITS=${#FAILED_UNIT_NAMES[@]}
+    fi
+    if [ "$FAILED_UNITS" -gt 0 ]; then
         # The unit names belong in the key: a second unit failing is news.
         record_issue warning "${FAILED_UNITS} failed systemd unit(s): ${FAILED_UNIT_NAMES[*]}" \
             "failed-units:$(printf '%s\n' "${FAILED_UNIT_NAMES[@]}" | sort | paste -sd, -)"
-    else
-        FAILED_UNITS=0
     fi
 }
 
@@ -2947,11 +2972,13 @@ render_status() {
 
     if [ -n "$FAILED_UNITS" ]; then
         if [ "$FAILED_UNITS" -gt 0 ]; then
-            printf '  %sFailed units:%s  %s%s%s\n' \
+            printf '  %sFailed units:%s  %s%s%s' \
                 "$YELLOW" "$NC" "$RED" "${FAILED_UNIT_NAMES[*]}" "$NC"
         else
-            printf '  %sFailed units:%s  none\n' "$YELLOW" "$NC"
+            printf '  %sFailed units:%s  none' "$YELLOW" "$NC"
         fi
+        [ ${#IGNORED_UNIT_NAMES[@]} -gt 0 ] && printf ' (ignored: %s)' "${IGNORED_UNIT_NAMES[*]}"
+        printf '\n'
     fi
 
     [ "$REBOOT_REQUIRED" != "unknown" ] && \
@@ -3219,6 +3246,11 @@ render_json() {
     printf '    "services_ok": %s,\n' "$(json_num "$SERVICES_OK")"
     printf '    "services_total": %s,\n' "$(json_num "$SERVICES_TOTAL")"
     printf '    "failed_units": %s,\n' "$(json_num "$FAILED_UNITS")"
+    local ignored_units="" unit
+    for unit in ${IGNORED_UNIT_NAMES[@]+"${IGNORED_UNIT_NAMES[@]}"}; do
+        ignored_units+="${ignored_units:+, }\"$(json_escape "$unit")\""
+    done
+    printf '    "failed_units_ignored": [%s],\n' "$ignored_units"
     printf '    "reboot_required": "%s",\n' "$REBOOT_REQUIRED"
     printf '    "updates_pending": %s,\n' "$(json_num "$UPDATES_TOTAL")"
     printf '    "updates_security": %s\n' "$(json_num "$UPDATES_SECURITY")"

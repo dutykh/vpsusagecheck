@@ -179,6 +179,7 @@ BANDWIDTH_LIMIT_TB=20 BANDWIDTH_WARN_PCT=85 ./munin-check.sh
 | `SHOW_TOP_PROCESSES` | `1` | Show top memory/CPU consumers |
 | `TOP_PROCESS_COUNT` | `3` | How many to list |
 | `CHECK_FAILED_UNITS` | `1` | Report failed systemd units |
+| `IGNORE_FAILED_UNITS` | empty | Failed units that are known and harmless: names or shell patterns such as `cloud-init-*.service`, separated by spaces or commas. They are still named in the report but raise no warning (see [A failed unit that is harmless](#a-failed-unit-that-is-harmless)) |
 | `CHECK_REBOOT_REQUIRED` | `1` | Report `/var/run/reboot-required` |
 | `CHECK_UPDATES` | `1` | Report pending (security) updates |
 | `STATE_DIR` | see below | Where the disk history, the cached scan and the alert memory are kept |
@@ -496,6 +497,28 @@ current user cannot read and says how many folders that was.
 The forecast needs at least three samples spanning 12 hours. Run the script
 hourly from cron (see [Hourly watch with alerts](#hourly-watch-with-alerts)).
 
+### A failed unit that is harmless
+
+The `Failed units` line, and with it the warning and the exit code 1, names every
+systemd unit in the failed state. On some VPS images one of them is
+`cloud-init-main.service`: the provider's first-boot setup runs a command of its
+own from the configuration disc attached to the machine, that command ends with
+an error, and systemd then marks the whole unit as failed although the server
+works. `cloud-init status --long` names the step that failed. Once you
+have looked at the reason for a failure and decided that it does not matter, list
+the unit in the configuration file:
+
+```bash
+IGNORE_FAILED_UNITS=cloud-init-main.service
+```
+
+Several units are separated by spaces or commas, and shell patterns are allowed
+(`cloud-init-*.service`). The unit is still named in the report, as
+`Failed units:  none (ignored: cloud-init-main.service)`, and in the `--json`
+output under `failed_units_ignored`, but it no longer raises a warning, changes
+the exit code or triggers an alert. Any other unit that fails is reported as
+before.
+
 ### Alerts do not arrive
 
 ```bash
@@ -544,6 +567,17 @@ Dr. Denys Dutykh (Khalifa University of Science and Technology, Abu Dhabi, UAE)
 GNU General Public License v3.0, see [LICENSE](LICENSE).
 
 ## Changelog
+
+### v2.2.0
+
+**Added**
+
+- `IGNORE_FAILED_UNITS`: failed systemd units that are known and harmless (for
+  example `cloud-init-main.service` on a VPS whose provider's first-boot command
+  exits with an error) can be listed by name or shell pattern. The report still
+  names them, as `Failed units:  none (ignored: ...)`, and the JSON output lists
+  them under `failed_units_ignored`, but they no longer raise a warning, change
+  the exit code or trigger an alert.
 
 ### v2.1.0
 

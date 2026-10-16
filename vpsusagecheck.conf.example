@@ -62,6 +62,12 @@ CHECK_FAILED_UNITS=1
 CHECK_REBOOT_REQUIRED=1
 CHECK_UPDATES=1
 
+# Failed systemd units that are known and harmless: names or shell patterns,
+# separated by spaces or commas (for example "cloud-init-main.service" or
+# "cloud-init-*.service"). The report still names them, but they raise no
+# warning and no alert.
+IGNORE_FAILED_UNITS=
+
 # --- State -----------------------------------------------------------------
 # Where the disk history, the cached folder scan and the alert memory are kept.
 # Empty: /var/lib/vpsusagecheck for root, ~/.local/state/vpsusagecheck otherwise.
