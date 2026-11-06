@@ -33,6 +33,8 @@ attention.
 - **Nagios-compatible exit codes** (0 OK / 1 WARNING / 2 CRITICAL) so cron
   wrappers and monitoring systems can act on the result without parsing text
 - **`--json` output** for piping into other tooling
+- **A summary of one line per check** at the end of the report: its verdict,
+  the measured values and the thresholds they are held against
 - **Memory, swap, load, CPU, disk and inode** checks with per-resource thresholds
 - **System health**: critical services, failed systemd units, reboot-required
   flag, pending security updates, top memory/CPU consumers
@@ -434,11 +436,56 @@ issue carries a stable `key` naming the kind of problem.
 | `[SPC]` | Disk forecast, folder scan, largest and fastest-growing folders, large files, what can be freed, deleted files still held open |
 | `[SYS]` | Munin plugin states, critical services, failed units, reboot flag, pending updates, uptime |
 | `[TOP]` | Top memory and CPU consumers |
-| `[---]` | Host summary, overall status, and every issue found |
+| `[---]` | The host, one line per check with its verdict, values and thresholds, and the overall status |
 
 Each resource has its own `NOTICE` / `WARNING` / `CRITICAL` thresholds; see the
 settings table above. Notices do not affect the exit code; warnings and
 criticals do.
+
+### The summary
+
+The report ends with one line per check, so that a glance tells what was
+tested, what was measured and how far each value stands from its thresholds. A
+typical run on a quiet server:
+
+```text
+[---] SUMMARY
+--------------------------------------------------------------------
+  myvps: Ubuntu 26.04.1 LTS, Linux 7.0.0-43-generic (x86_64), run as dds, up 40 minutes
+
+  OK        Bandwidth     4.08 GB sent, 0.01% of 32 TB (notice >50%, warning >80%); month end 0.07% (warning >100%)
+  OK        Memory        3.74 GB of 62.79 GB in use, 6.0% (notice >75%, warning >90%)
+  N/A       Swap          no swap space on this machine
+  OK        Load          1-minute load 0.32 on 16 cores, 2.0% of capacity (notice >75%, warning >100%)
+  OK        Disk space    / 9%, /boot 18%, /boot/efi 7% (notice >80%, warning >90%, critical >95%)
+  OK        Inodes        / 2%, /boot 1% (notice >80%, warning >90%)
+  OK        Disk growth   nothing filling up over the last 6 days (notice <30 days left, warning <14, critical <3)
+  OK        Reclaimable   3.51 GB safe in 6 items, 514.70 MB to review, scan 43 min ago (notice from 5 GB safe)
+  OK        Deleted files none held open by the programs of dds (notice from 500.00 MB)
+  OK        Munin         0 critical, 0 warning, 0 unknown plugin states
+  OK        Services      ssh and cron running
+  OK        Failed units  none
+  OK        Reboot        not needed
+  OK        Updates       none pending (warning on any security update)
+
+Overall status: OK (exit 0), nothing needs attention
+```
+
+The first column is the verdict. `OK`, `NOTICE`, `WARNING` and `CRITICAL` come
+from the very problems that set the exit code and trigger the alerts, so the
+summary can never disagree with them; a line that crosses a threshold reads, for
+instance,
+`WARNING   Memory        57.33 GB of 62.79 GB in use, 91.3% (notice >75%, warning >90%)`.
+`OFF` marks a check switched off by a setting (`CHECK_UPDATES=0`, `DISK_SCAN=0`,
+a state directory that cannot be written), and `N/A` a check with nothing to
+measure on this machine (no swap, no Munin, no systemd). The thresholds in
+parentheses are the configured ones; a percentage must exceed its threshold to
+count, and a disk is flagged when fewer days than stated are left before it is
+full. The Disk growth line names the filesystem that will be full soonest, and
+mentions a burst of the last 24 hours when one was recorded; the Reclaimable line
+says how old the folder scan behind it is. Should a future check record a problem
+that no line covers, it is printed under the name `Other`, and the last line
+counts the warnings and notices.
 
 ## Troubleshooting
 
@@ -567,6 +614,32 @@ Dr. Denys Dutykh (Khalifa University of Science and Technology, Abu Dhabi, UAE)
 GNU General Public License v3.0, see [LICENSE](LICENSE).
 
 ## Changelog
+
+### v2.3.0
+
+**Changed**
+
+- The summary at the end of the report gives one line per check (bandwidth,
+  memory, swap, load, disk space, inodes, disk growth, reclaimable space, deleted
+  files still open, Munin, services, failed units, reboot, updates), each with
+  its verdict, the measured values and the thresholds they are held against,
+  then the overall status with the number of warnings and notices. The verdict
+  of a line comes from the same recorded problems as the exit code and the
+  alerts. The list of problem messages that the summary used to print is gone
+  from the text report, since each problem now sits on its own line; the JSON
+  output and the alert message are unchanged.
+
+**Fixed**
+
+- Without `jq`, the month's traffic was read from fields 14 and 15 of
+  `vnstat --oneline`, which hold the all-time totals, so that a host without
+  `jq` reported its whole history as this month's usage. Fields 9 and 10, the
+  current month, are now read.
+- Between the notice and the warning thresholds, a month heading past the cap
+  raised only the notice, because the month-end projection was tested only below
+  the notice threshold; the same projection below that threshold gave a warning.
+  The projection is now tested whenever the warning on current usage has not
+  been raised already.
 
 ### v2.2.0
 

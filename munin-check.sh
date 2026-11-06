@@ -22,7 +22,7 @@ set -uo pipefail
 # numeric comparison in the script.
 export LC_ALL=C
 
-readonly VERSION="2.2.0"
+readonly VERSION="2.3.0"
 readonly PROGNAME="${0##*/}"
 
 # Exit codes (Nagios-compatible).
@@ -531,10 +531,11 @@ vnstat_monthly() {
             | "\(.rx) \(.tx)"' 2>/dev/null)
     else
         # --oneline is a stable, documented CSV; with "b" the totals are bytes.
-        # Fields 14 and 15 are the current month's rx and tx.
+        # Fields 9 and 10 are the current month's rx and tx; 13 to 15 are the
+        # all-time totals, which must not be taken for the month.
         out=$(vnstat --oneline b ${ifarg[@]+"${ifarg[@]}"} 2>/dev/null) || return 1
-        rx=$(printf '%s' "$out" | awk -F';' '{print $14}')
-        tx=$(printf '%s' "$out" | awk -F';' '{print $15}')
+        rx=$(printf '%s' "$out" | awk -F';' '{print $9}')
+        tx=$(printf '%s' "$out" | awk -F';' '{print $10}')
     fi
 
     if ! is_number "${rx:-}" || ! is_number "${tx:-}"; then return 1; fi
@@ -682,13 +683,19 @@ collect_network() {
             record_issue warning \
                 "Outbound bandwidth at ${NET_PCT}% of the ${BANDWIDTH_LIMIT_TB}TB monthly cap" \
                 bandwidth
-        elif compare_gt "$NET_PCT" "$BANDWIDTH_NOTICE_PCT"; then
-            record_issue notice \
-                "Over ${BANDWIDTH_NOTICE_PCT}% of the monthly bandwidth cap used" bandwidth
-        elif compare_gt "${NET_PROJECTED_PCT:-0}" "100"; then
-            record_issue warning \
-                "Projected to exceed the monthly cap (${NET_PROJECTED_PCT}% by month end)" \
-                bandwidth-projection
+        else
+            if compare_gt "$NET_PCT" "$BANDWIDTH_NOTICE_PCT"; then
+                record_issue notice \
+                    "Over ${BANDWIDTH_NOTICE_PCT}% of the monthly bandwidth cap used" bandwidth
+            fi
+            # Tested on its own: between the notice and the warning thresholds a
+            # month heading past the cap still deserves the warning it gets below
+            # the notice threshold.
+            if compare_gt "${NET_PROJECTED_PCT:-0}" "100"; then
+                record_issue warning \
+                    "Projected to exceed the monthly cap (${NET_PROJECTED_PCT}% by month end)" \
+                    bandwidth-projection
+            fi
         fi
     else
         record_issue notice \
@@ -790,7 +797,8 @@ collect_load() {
 # ---------------------------------------------------------------------------
 # Rows are "mount|filesystem|type|size_kb|used_kb|avail_kb|use_pct|level".
 DISK_ROWS=()
-INODE_ROWS=()
+INODE_ROWS=()     # the filesystems whose inode use is high, for the disk section
+INODE_ALL=()      # "mount|pct|level" for every filesystem that counts inodes
 
 collect_disk() {
     command_exists df || return 0
@@ -836,6 +844,7 @@ collect_disk() {
             level="notice"
             record_issue notice "$mount inode usage at ${pct}%" "inodes:$mount"
         fi
+        INODE_ALL+=("$mount|$pct|$level")
         [ "$level" = "ok" ] && continue
         INODE_ROWS+=("$mount|$inodes|$iused|$ifree|$pct|$level")
     done < <(df -PTi 2>/dev/null | tail -n +2)
@@ -845,7 +854,7 @@ collect_disk() {
 # System health
 # ---------------------------------------------------------------------------
 MUNIN_CRITICAL="" MUNIN_WARNING="" MUNIN_UNKNOWN=""
-SERVICES_OK="" SERVICES_TOTAL="" SERVICES_DOWN=()
+SERVICES_OK="" SERVICES_TOTAL="" SERVICES_DOWN=() SERVICES_CHECKED=()
 FAILED_UNITS="" FAILED_UNIT_NAMES=() IGNORED_UNIT_NAMES=()
 REBOOT_REQUIRED="unknown"
 UPDATES_TOTAL="" UPDATES_SECURITY=""
@@ -884,6 +893,7 @@ collect_services() {
         fi
         [ -n "$name" ] || continue
 
+        SERVICES_CHECKED+=("$name")
         SERVICES_TOTAL=$((SERVICES_TOTAL + 1))
         if service_is_active "$name"; then
             SERVICES_OK=$((SERVICES_OK + 1))
@@ -3014,39 +3024,431 @@ render_top_processes() {
     printf '\n'
 }
 
+# ---------------------------------------------------------------------------
+# Summary: one line per check
+# ---------------------------------------------------------------------------
+# Each line gives the verdict, the name of the check, the measured values and,
+# in parentheses, the thresholds they are held against. The verdict is read
+# from the recorded issues rather than worked out a second time, so that the
+# summary, the exit code and the alerts cannot disagree. OFF marks a check
+# switched off by a setting, N/A a check with nothing to measure here.
+SUMMARY_LEVEL=""
+declare -A SUMMARY_CLAIMED=()
+
+# summary_level <pattern...>: sets SUMMARY_LEVEL to the highest level among the
+# issues whose key matches one of the shell patterns ("" when none does) and
+# marks those issues as shown. It sets a variable instead of printing, since a
+# command substitution would run it in a subshell and lose the marks.
+summary_level() {
+    local i key pattern level rank best_rank=0
+    SUMMARY_LEVEL=""
+    for i in ${ISSUES[@]+"${!ISSUES[@]}"}; do
+        key="${ISSUE_KEYS[$i]}"
+        for pattern in "$@"; do
+            # The unquoted right-hand side is deliberate: it is a pattern.
+            # shellcheck disable=SC2053
+            [[ $key == $pattern ]] || continue
+            SUMMARY_CLAIMED[$i]=1
+            level="${ISSUES[$i]%%|*}"
+            rank=$(level_rank "$level")
+            if [ "$rank" -gt "$best_rank" ]; then
+                best_rank=$rank
+                SUMMARY_LEVEL=$level
+            fi
+            break
+        done
+    done
+    return 0
+}
+
+# summary_line <verdict> <name> <text>; the verdict is ok, notice, warning,
+# critical, off or n/a.
+summary_line() {
+    local label colour
+    case "$1" in
+        critical) label="CRITICAL"; colour="$RED$BOLD" ;;
+        warning)  label="WARNING";  colour="$RED" ;;
+        notice)   label="NOTICE";   colour="$YELLOW" ;;
+        off)      label="OFF";      colour="$CYAN" ;;
+        n/a)      label="N/A";      colour="$CYAN" ;;
+        *)        label="OK";       colour="$GREEN" ;;
+    esac
+    printf '  %s%-8s%s  %-13s %s\n' "$colour" "$label" "$NC" "$2" "$3"
+}
+
+# join_words <word...>: "a", "a and b", "a, b and c".
+join_words() {
+    local out="" i n=$#
+    for ((i = 1; i <= n; i++)); do
+        if [ "$i" -eq 1 ]; then out="${!i}"
+        elif [ "$i" -eq "$n" ]; then out+=" and ${!i}"
+        else out+=", ${!i}"
+        fi
+    done
+    printf '%s' "$out"
+}
+
+# issue_key_present <key>: true when an issue with exactly this key was recorded.
+issue_key_present() {
+    local key
+    for key in ${ISSUE_KEYS[@]+"${ISSUE_KEYS[@]}"}; do
+        [ "$key" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# span_phrase <hours>: "7 days", "20 h".
+span_phrase() {
+    awk -v h="${1:-0}" 'BEGIN {
+        if (h >= 36) printf "%.0f days", h / 24
+        else         printf "%.0f h", h
+    }'
+}
+
+summary_bandwidth() {
+    local text what
+    summary_level bandwidth 'bandwidth-*'
+    if [ -z "$NET_COUNTED" ]; then
+        text="no month-to-date counter, so the cap cannot be checked (install vnstat)"
+        if [ -n "$NET_BOOT_TX" ]; then
+            text+="; since boot $(bytes_to_human "$NET_BOOT_RX") in, $(bytes_to_human "$NET_BOOT_TX") out"
+        fi
+        summary_line "${SUMMARY_LEVEL:-notice}" Bandwidth "$text"
+        return
+    fi
+    case "$BANDWIDTH_COUNT_MODE" in
+        in)  what="received" ;;
+        sum) what="in and out" ;;
+        max) what="in the busier direction" ;;
+        *)   what="sent" ;;
+    esac
+    text="$(bytes_to_human "$NET_COUNTED") $what, ${NET_PCT}% of ${BANDWIDTH_LIMIT_TB} TB"
+    text+=" (notice >${BANDWIDTH_NOTICE_PCT}%, warning >${BANDWIDTH_WARN_PCT}%)"
+    if [ -n "$NET_PROJECTED_PCT" ]; then
+        text+="; month end ${NET_PROJECTED_PCT}% (warning >100%)"
+    fi
+    summary_line "${SUMMARY_LEVEL:-ok}" Bandwidth "$text"
+}
+
+summary_memory() {
+    summary_level memory
+    if [ -z "$MEM_PCT" ]; then
+        summary_line n/a Memory "no memory figures (/proc/meminfo unreadable)"
+        return
+    fi
+    summary_line "${SUMMARY_LEVEL:-ok}" Memory \
+        "$(kb_to_human "$MEM_USED_KB") of $(kb_to_human "$MEM_TOTAL_KB") in use, ${MEM_PCT}% (notice >${MEMORY_NOTICE_PCT}%, warning >${MEMORY_WARN_PCT}%)"
+}
+
+summary_swap() {
+    summary_level swap
+    if [ -n "$SWAP_TOTAL_KB" ]; then
+        summary_line "${SUMMARY_LEVEL:-ok}" Swap \
+            "$(kb_to_human "$SWAP_USED_KB") of $(kb_to_human "$SWAP_TOTAL_KB") in use, ${SWAP_PCT}% (notice >${SWAP_NOTICE_PCT}%, warning >${SWAP_WARN_PCT}%)"
+    elif [ -n "$MEM_PCT" ]; then
+        summary_line n/a Swap "no swap space on this machine"
+    else
+        summary_line n/a Swap "no memory figures (/proc/meminfo unreadable)"
+    fi
+}
+
+summary_load() {
+    local warn_pct
+    summary_level load
+    if [ -z "$LOAD_1" ]; then
+        summary_line n/a Load "no load figures (/proc/loadavg unreadable)"
+        return
+    fi
+    # The warning compares the load with cores x LOAD_WARN_MULTIPLIER, that is
+    # the capacity with 100 x LOAD_WARN_MULTIPLIER per cent.
+    warn_pct=$(awk -v m="$LOAD_WARN_MULTIPLIER" 'BEGIN {printf "%g", m * 100}')
+    summary_line "${SUMMARY_LEVEL:-ok}" Load \
+        "1-minute load ${LOAD_1} on $(plural "$CPU_CORES" core cores), ${LOAD_PCT}% of capacity (notice >${LOAD_NOTICE_PCT}%, warning >${warn_pct}%)"
+}
+
+summary_disk_space() {
+    local row mount pct level entries=""
+    summary_level 'disk-full:*'
+    if [ ${#DISK_ROWS[@]} -eq 0 ]; then
+        summary_line n/a "Disk space" "no filesystem to check"
+        return
+    fi
+    for row in "${DISK_ROWS[@]}"; do
+        IFS='|' read -r mount _ _ _ _ _ pct level <<<"$row"
+        entries+="${entries:+, }$mount ${pct:-n/a}${pct:+%}"
+        [ "$level" != "ok" ] && entries+=" ($level)"
+    done
+    summary_line "${SUMMARY_LEVEL:-ok}" "Disk space" \
+        "$entries (notice >${DISK_NOTICE_PCT}%, warning >${DISK_WARN_PCT}%, critical >${DISK_CRITICAL_PCT}%)"
+}
+
+summary_inodes() {
+    local row mount pct level entries=""
+    summary_level 'inodes:*'
+    if [ ${#INODE_ALL[@]} -eq 0 ]; then
+        summary_line n/a Inodes "no filesystem counts inodes"
+        return
+    fi
+    for row in "${INODE_ALL[@]}"; do
+        IFS='|' read -r mount pct level <<<"$row"
+        entries+="${entries:+, }$mount ${pct}%"
+        [ "$level" != "ok" ] && entries+=" ($level)"
+    done
+    summary_line "${SUMMARY_LEVEL:-ok}" Inodes \
+        "$entries (notice >${INODE_NOTICE_PCT}%, warning >${INODE_WARN_PCT}%)"
+}
+
+summary_disk_growth() {
+    local row mount state slope pace days span text when limits
+    local total=0 growing=0 collecting=0 first="" first_days="" first_slope="" span_max=0
+    limits="(notice <${DISK_FILL_NOTICE_DAYS} days left, warning <${DISK_FILL_WARN_DAYS}, critical <${DISK_FILL_CRITICAL_DAYS})"
+    summary_level 'disk-fill:*' 'disk-burst:*'
+    if [ "$STATE_OK" -ne 1 ]; then
+        summary_line off "Disk growth" "no history kept: cannot write to $STATE_DIR"
+        return
+    fi
+    for row in ${TREND_ROWS[@]+"${TREND_ROWS[@]}"}; do
+        IFS='|' read -r mount state slope _ days _ span _ <<<"$row"
+        total=$((total + 1))
+        case "$state" in
+            collecting)
+                collecting=$((collecting + 1))
+                continue
+                ;;
+            growing)
+                growing=$((growing + 1))
+                if [ -z "$first" ] || compare_gt "$first_days" "$days"; then
+                    first="$mount" first_days="$days" first_slope="$slope"
+                fi
+                ;;
+        esac
+        compare_gt "$span" "$span_max" && span_max="$span"
+    done
+    if [ "$total" -eq 0 ]; then
+        summary_line n/a "Disk growth" "no history yet"
+        return
+    fi
+    if [ "$collecting" -eq "$total" ]; then
+        summary_line n/a "Disk growth" \
+            "collecting history; a forecast needs ${TREND_MIN_SPAN_HOURS} h of it"
+        return
+    fi
+    if [ "$growing" -gt 0 ]; then
+        text="$first grows by $(kb_to_human "$first_slope") a day"
+        if compare_gt "$first_days" 365; then
+            text+=", more than a year of space left"
+        else
+            when=$(date -d "@$(awk -v d="$first_days" -v n="$(date +%s)" \
+                'BEGIN {printf "%.0f", n + d * 86400}')" '+%-d %b' 2>/dev/null)
+            text+=", full in $(days_phrase "$first_days")${when:+ (around $when)}"
+        fi
+        [ "$growing" -gt 1 ] && text+=", $((growing - 1)) more growing"
+    else
+        text="nothing filling up over the last $(span_phrase "$span_max")"
+        [ "$collecting" -gt 0 ] && text+=", $collecting still collecting history"
+    fi
+    for row in ${TREND_ROWS[@]+"${TREND_ROWS[@]}"}; do
+        IFS='|' read -r mount _ _ pace _ <<<"$row"
+        if issue_key_present "disk-burst:$mount"; then
+            text+="; $mount grew by $(kb_to_human "$pace") in the last 24 h"
+        fi
+    done
+    summary_line "${SUMMARY_LEVEL:-ok}" "Disk growth" "$text $limits"
+}
+
+summary_reclaimable() {
+    local line safety safe_count=0 age="" text scan
+    summary_level disk-reclaimable
+    case "$SCAN_STATUS" in
+        disabled)
+            summary_line off Reclaimable "folder scan off (DISK_SCAN=0)"
+            return
+            ;;
+        none)
+            summary_line n/a Reclaimable "no folder scan yet (run $PROGNAME --scan)"
+            return
+            ;;
+    esac
+    for line in ${SAVING_ROWS[@]+"${SAVING_ROWS[@]}"}; do
+        IFS=$'\t' read -r _ _ safety _ <<<"$line"
+        [ "$safety" = "safe" ] && safe_count=$((safe_count + 1))
+    done
+    if [ "$SAVINGS_SAFE_KB" -gt 0 ]; then
+        text="$(kb_to_human "$SAVINGS_SAFE_KB") safe in $(plural "$safe_count" item items)"
+    else
+        text="nothing safe to free"
+    fi
+    [ "$SAVINGS_REVIEW_KB" -gt 0 ] && text+=", $(kb_to_human "$SAVINGS_REVIEW_KB") to review"
+    is_number "$SCAN_FINISHED" && age=$(human_age $(( $(date +%s) - SCAN_FINISHED )))
+    scan="scan ${age:-of unknown age}"
+    [ "$SCAN_STATUS" = "complete" ] || scan+=", $SCAN_STATUS"
+    summary_line "${SUMMARY_LEVEL:-ok}" Reclaimable \
+        "$text, $scan (notice from ${DISK_RECLAIM_NOTICE_GB} GB safe)"
+}
+
+summary_deleted() {
+    local who top_pid top_comm text
+    summary_level deleted-open
+    if [ "$EUID" -eq 0 ]; then who="any program"; else who="the programs of $ME"; fi
+    if [ "${DELETED_KB:-0}" -gt 0 ]; then
+        text="$(kb_to_human "$DELETED_KB") held open by $who"
+        if [ ${#DELETED_ROWS[@]} -gt 0 ]; then
+            IFS=$'\t' read -r _ top_pid top_comm _ <<<"${DELETED_ROWS[0]}"
+            text+=", most by $top_comm (pid $top_pid)"
+        fi
+    else
+        text="none held open by $who"
+    fi
+    summary_line "${SUMMARY_LEVEL:-ok}" "Deleted files" \
+        "$text (notice from $(kb_to_human "$DELETED_OPEN_NOTICE_KB"))"
+}
+
+summary_munin() {
+    summary_level munin
+    if [ -z "$MUNIN_CRITICAL" ]; then
+        summary_line n/a Munin "no problems page to read (needs Munin and w3m)"
+        return
+    fi
+    summary_line "${SUMMARY_LEVEL:-ok}" Munin \
+        "${MUNIN_CRITICAL} critical, ${MUNIN_WARNING} warning, ${MUNIN_UNKNOWN} unknown plugin states"
+}
+
+summary_services() {
+    local name text down=" "
+    local -a up=()
+    summary_level 'service:*'
+    if [ "${SERVICES_TOTAL:-0}" -eq 0 ]; then
+        summary_line n/a Services "neither ssh nor cron found"
+        return
+    fi
+    for name in ${SERVICES_DOWN[@]+"${SERVICES_DOWN[@]}"}; do down+="$name "; done
+    for name in ${SERVICES_CHECKED[@]+"${SERVICES_CHECKED[@]}"}; do
+        case "$down" in *" $name "*) ;; *) up+=("$name") ;; esac
+    done
+    if [ ${#SERVICES_DOWN[@]} -gt 0 ]; then
+        text="$(join_words "${SERVICES_DOWN[@]}") not running"
+        [ ${#up[@]} -gt 0 ] && text+=", $(join_words "${up[@]}") running"
+    else
+        text="$(join_words ${up[@]+"${up[@]}"}) running"
+    fi
+    summary_line "${SUMMARY_LEVEL:-ok}" Services "$text"
+}
+
+summary_failed_units() {
+    local text
+    summary_level 'failed-units:*'
+    if [ "$CHECK_FAILED_UNITS" != "1" ]; then
+        summary_line off "Failed units" "check off (CHECK_FAILED_UNITS=0)"
+        return
+    fi
+    if [ -z "$FAILED_UNITS" ]; then
+        summary_line n/a "Failed units" "no systemd on this machine"
+        return
+    fi
+    if [ "$FAILED_UNITS" -gt 0 ]; then
+        text="$(plural "$FAILED_UNITS" unit units) failed: ${FAILED_UNIT_NAMES[*]}"
+    else
+        text="none"
+    fi
+    [ ${#IGNORED_UNIT_NAMES[@]} -gt 0 ] && text+=" (ignored: ${IGNORED_UNIT_NAMES[*]})"
+    summary_line "${SUMMARY_LEVEL:-ok}" "Failed units" "$text"
+}
+
+summary_reboot() {
+    summary_level reboot
+    case "$REBOOT_REQUIRED" in
+        yes) summary_line "${SUMMARY_LEVEL:-notice}" Reboot "needed to finish applying updates" ;;
+        no)  summary_line "${SUMMARY_LEVEL:-ok}" Reboot "not needed" ;;
+        *)   summary_line off Reboot "check off (CHECK_REBOOT_REQUIRED=0)" ;;
+    esac
+}
+
+summary_updates() {
+    local text
+    summary_level security-updates
+    if [ "$CHECK_UPDATES" != "1" ]; then
+        summary_line off Updates "check off (CHECK_UPDATES=0)"
+        return
+    fi
+    if [ -z "$UPDATES_TOTAL" ]; then
+        summary_line n/a Updates "no update information (apt-check unavailable)"
+        return
+    fi
+    if [ "$UPDATES_TOTAL" -eq 0 ]; then
+        text="none pending"
+    elif [ -n "$UPDATES_SECURITY" ]; then
+        text="$UPDATES_TOTAL pending, $UPDATES_SECURITY of them security"
+    else
+        text="$UPDATES_TOTAL pending, security count unknown"
+    fi
+    summary_line "${SUMMARY_LEVEL:-ok}" Updates "$text (warning on any security update)"
+}
+
 render_summary() {
+    local host distro="" up text i label colour
+    local critical=0 warnings=0 notices=0
+    local -a counts=()
+    SUMMARY_CLAIMED=()
+
     printf '%s%s[---] SUMMARY%s\n' "$BOLD" "$PURPLE" "$NC"
     section_rule
-    printf '  %sOS:%s     %s %s (%s)\n' "$CYAN" "$NC" "$(uname -s)" "$(uname -r)" "$(uname -m)"
+
+    host=$(hostname 2>/dev/null)
     if [ -r /etc/os-release ]; then
-        printf '  %sDistro:%s %s\n' "$CYAN" "$NC" \
-            "$(awk -F= '/^PRETTY_NAME=/ {gsub(/"/, "", $2); print $2; exit}' /etc/os-release)"
+        distro=$(awk -F= '/^PRETTY_NAME=/ {gsub(/"/, "", $2); print $2; exit}' /etc/os-release)
     fi
-    printf '  %sUser:%s   %s\n' "$CYAN" "$NC" "$(id -un)"
-    printf '\n'
+    text="${distro:+$distro, }$(uname -s) $(uname -r) ($(uname -m)), run as $ME"
+    if command_exists uptime && up=$(uptime -p 2>/dev/null) && [ -n "$up" ]; then
+        text+=", $up"
+    fi
+    printf '  %s%s:%s %s\n\n' "$CYAN" "${host:-this host}" "$NC" "$text"
 
-    local label colour
-    case "$OVERALL_STATUS" in
-        "$EXIT_CRITICAL") label="CRITICAL"; colour="$RED"    ;;
-        "$EXIT_WARNING")  label="WARNING";  colour="$YELLOW" ;;
-        *)                label="OK";       colour="$GREEN"  ;;
-    esac
-    printf '%s%sOverall status: %s%s (exit %s)\n' \
-        "$BOLD" "$colour" "$label" "$NC" "$OVERALL_STATUS"
+    summary_bandwidth
+    summary_memory
+    summary_swap
+    summary_load
+    summary_disk_space
+    summary_inodes
+    summary_disk_growth
+    summary_reclaimable
+    summary_deleted
+    summary_munin
+    summary_services
+    summary_failed_units
+    summary_reboot
+    summary_updates
 
-    local issue level message
-    for issue in ${ISSUES[@]+"${ISSUES[@]}"}; do
-        level="${issue%%|*}"
-        message="${issue#*|}"
-        case "$level" in
-            critical) colour="$RED"    ;;
-            warning)  colour="$RED"    ;;
-            *)        colour="$YELLOW" ;;
-        esac
-        printf '  %s[%s]%s %s\n' "$colour" "$level" "$NC" "$message"
+    # An issue that no line has shown still appears, so that nothing can
+    # vanish from the summary when a new check is added.
+    for i in ${ISSUES[@]+"${!ISSUES[@]}"}; do
+        [ -n "${SUMMARY_CLAIMED[$i]:-}" ] && continue
+        summary_line "${ISSUES[$i]%%|*}" Other "${ISSUES[$i]#*|}"
     done
-    [ ${#ISSUES[@]} -eq 0 ] && printf '  %sNothing needs attention.%s\n' "$GREEN" "$NC"
-    printf '\n'
+
+    for i in ${ISSUES[@]+"${!ISSUES[@]}"}; do
+        case "${ISSUES[$i]%%|*}" in
+            critical) critical=$((critical + 1)) ;;
+            warning)  warnings=$((warnings + 1)) ;;
+            *)        notices=$((notices + 1)) ;;
+        esac
+    done
+    [ "$critical" -gt 0 ] && counts+=("$critical critical")
+    [ "$warnings" -gt 0 ] && counts+=("$(plural "$warnings" warning warnings)")
+    [ "$notices" -gt 0 ]  && counts+=("$(plural "$notices" notice notices)")
+
+    case "$OVERALL_STATUS" in
+        "$EXIT_CRITICAL") label="CRITICAL"; colour="$RED"   ;;
+        "$EXIT_WARNING")  label="WARNING";  colour="$RED"   ;;
+        *)                label="OK";       colour="$GREEN" ;;
+    esac
+    if [ ${#counts[@]} -gt 0 ]; then
+        text=$(join_words "${counts[@]}")
+    else
+        text="nothing needs attention"
+    fi
+    # The colour first: its code begins with a reset, which would cancel the bold.
+    printf '\n%s%sOverall status: %s%s (exit %s), %s\n\n' \
+        "$colour" "$BOLD" "$label" "$NC" "$OVERALL_STATUS" "$text"
 }
 
 render_text() {
