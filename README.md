@@ -1,3 +1,5 @@
+<!-- Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of Science and Technology, Abu Dhabi, UAE) -->
+
 # VPS Usage Check
 
 A single-file shell report for Ubuntu/Debian VPS hosts: network, memory, CPU,
@@ -394,10 +396,10 @@ cp ~/tools/vpsusagecheck/hermes/vps-disk-cleanup/SKILL.md ~/.hermes/skills/devop
 The items that need root (`journal`, `apt`, `snaps`) come back with the command
 for you to paste. To let Hermes do the journal and the APT cache as well, allow
 exactly these two commands without a password (`sudo visudo -f
-/etc/sudoers.d/vpsusagecheck`, replacing `dds` by that user):
+/etc/sudoers.d/vpsusagecheck`, replacing `ubuntu` by that user):
 
 ```text
-dds ALL=(root) NOPASSWD: /usr/bin/journalctl --vacuum-size=200M, /usr/bin/apt-get clean
+ubuntu ALL=(root) NOPASSWD: /usr/bin/journalctl --vacuum-size=200M, /usr/bin/apt-get clean
 ```
 
 Old snap revisions stay manual: a sudo rule for `snap remove` could not be
@@ -451,7 +453,7 @@ typical run on a quiet server:
 ```text
 [---] SUMMARY
 --------------------------------------------------------------------
-  myvps: Ubuntu 26.04.1 LTS, Linux 7.0.0-43-generic (x86_64), run as dds, up 40 minutes
+  myvps: Ubuntu 26.04.1 LTS, Linux 7.0.0-43-generic (x86_64), run as ubuntu, up 40 minutes
 
   OK        Bandwidth     4.08 GB sent, 0.01% of 32 TB (notice >50%, warning >80%); month end 0.07% (warning >100%)
   OK        Memory        3.74 GB of 62.79 GB in use, 6.0% (notice >75%, warning >90%)
@@ -461,7 +463,7 @@ typical run on a quiet server:
   OK        Inodes        / 2%, /boot 1% (notice >80%, warning >90%)
   OK        Disk growth   nothing filling up over the last 6 days (notice <30 days left, warning <14, critical <3)
   OK        Reclaimable   3.51 GB safe in 6 items, 514.70 MB to review, scan 43 min ago (notice from 5 GB safe)
-  OK        Deleted files none held open by the programs of dds (notice from 500.00 MB)
+  OK        Deleted files none held open by the programs of ubuntu (notice from 500.00 MB)
   OK        Munin         0 critical, 0 warning, 0 unknown plugin states
   OK        Services      ssh and cron running
   OK        Failed units  none
@@ -595,6 +597,7 @@ Both are run by hand before a change goes in. The script can also be sourced
 | `hermes/vps-disk-cleanup/SKILL.md` | Hermes skill: free space when you reply to an alert |
 | `.shellcheckrc` | Lint configuration |
 | `README.md` | This document |
+| `CITATION.cff` | How to cite the tool, read by GitHub |
 | `LICENSE` | GNU GPL v3 |
 
 ## Author
@@ -609,9 +612,16 @@ Dr. Denys Dutykh (Khalifa University of Science and Technology, Abu Dhabi, UAE)
 4. Run `shellcheck munin-check.sh` and test on an Ubuntu host
 5. Submit a pull request
 
+## How to cite
+
+The file [`CITATION.cff`](CITATION.cff) describes the tool for citation, and
+GitHub turns it into a reference, in APA or BibTeX, through the "Cite this
+repository" button of the repository page.
+
 ## License
 
-GNU General Public License v3.0, see [LICENSE](LICENSE).
+GNU General Public License, version 3 or later (`GPL-3.0-or-later`, as the
+header of the script states), see [LICENSE](LICENSE).
 
 ## Changelog
 

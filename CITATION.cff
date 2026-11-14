@@ -1,0 +1,34 @@
+# Dr. Denys Dutykh (Mathematics Department, Khalifa University of Science and Technology, Abu Dhabi, UAE)
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "VPS Usage Check (vpsusagecheck): bandwidth, disk and health report for Ubuntu and Debian servers"
+type: software
+authors:
+  - family-names: Dutykh
+    given-names: Denys
+    affiliation: "Khalifa University of Science and Technology"
+    orcid: "https://orcid.org/0000-0001-5247-2788"
+repository-code: "https://github.com/dutykh/vpsusagecheck"
+license: GPL-3.0-or-later
+version: 2.3.0
+date-released: "2026-11-15"
+keywords:
+  - vps
+  - monitoring
+  - bandwidth-monitoring
+  - disk-usage
+  - vnstat
+  - sysadmin
+  - linux
+  - ubuntu
+  - bash
+  - shell
+abstract: >-
+  Single-file Bash report on an Ubuntu or Debian server: the month's traffic against the
+  provider's bandwidth cap with a projection to the end of the month (from vnstat, Munin or the
+  kernel counters), memory, swap, load, disks and inodes, services, failed units and pending
+  updates, with exit codes that a monitoring system understands and a JSON output. For the disks
+  it forecasts when each filesystem will be full from a week of history, names the largest and
+  fastest-growing folders, and lists what can be freed safely with the exact command for each
+  item; run hourly from cron, it sends a short alert through the Hermes agent or any command only
+  when something needs attention.

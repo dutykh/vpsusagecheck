@@ -17,10 +17,10 @@ metadata:
 vpsusagecheck (the command `munin-check`) watches the disks of this server and
 sends its alerts to the user through Hermes. An alert lists the space that can
 be freed safely, one item per line, each with a short name in parentheses:
-`pnpm-store`, `npm-cache`, `conda-pkgs`, `cache:pip`,
-`next-cache:academic-web-genesis`, `old-versions:warp`, `journal`, `apt`,
-`snaps`. Every such item holds only data that is rebuilt or downloaded again
-when needed.
+`pnpm-store`, `npm-cache`, `conda-pkgs`, `cache:pip`, `next-cache:mysite` (the
+Next.js build cache of the website kept in a folder named `mysite`),
+`old-versions:warp`, `journal`, `apt`, `snaps`. Every such item holds only data
+that is rebuilt or downloaded again when needed.
 
 ## When to Use
 
@@ -38,7 +38,7 @@ when needed.
    - "everything", "all", "yes", "free it", with no item named: `all`;
    - items named by the user: the matching names from the list ("the pnpm
      store" is `pnpm-store`, "npm" is `npm-cache`, "the Next.js cache of the
-     academic site" is `next-cache:academic-web-genesis`).
+     website" is the `next-cache:` item named after the folder of that site).
    If the request is ambiguous, ask the user before acting.
 3. Run `munin-check --free all` or `munin-check --free NAME,NAME`.
 4. Reply in plain words, result first: how much was freed and how much free
